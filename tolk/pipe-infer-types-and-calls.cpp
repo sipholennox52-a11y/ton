@@ -14,11 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "tolk.h"
-#include "src-file.h"
 #include "ast.h"
 #include "ast-visitor.h"
+#include "compilation-errors.h"
+#include "src-file.h"
 #include "generics-helpers.h"
+#include "overload-resolution.h"
+#include "pack-unpack-api.h"
 #include "type-system.h"
 #include "smart-casts-cfg.h"
 #include <charconv>
@@ -106,67 +108,49 @@ static TypePtr get_or_infer_return_type(FunctionPtr fun_ref) {
   return fun_ref->inferred_return_type;
 }
 
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(TypePtr type) {
-  return "`" + type->as_human_readable() + "`";
-}
-
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(AnyExprV v_with_type) {
-  return "`" + v_with_type->inferred_type->as_human_readable() + "`";
-}
-
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(FunctionPtr fun_ref) {
-  return "`" + fun_ref->as_human_readable() + "`";
-}
-
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(StructPtr struct_ref) {
-  return "`" + struct_ref->as_human_readable() + "`";
-}
-
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(AliasDefPtr alias_ref) {
-  return "`" + alias_ref->as_human_readable() + "`";
-}
-
-GNU_ATTRIBUTE_NOINLINE
-static std::string to_string(std::string_view string_view) {
-  return static_cast<std::string>(string_view);
-}
-
-// fire an error when `fun f<T>(...) asm ...` is called with T=(int,int) or other non-1 width on stack
+// make an error when `fun f<T>(...) asm ...` is called with T=(int,int) or other non-1 width on stack
 // asm functions generally can't handle it, they expect T to be a TVM primitive
 // (in FunC, `forall` type just couldn't be unified with non-primitives; in Tolk, generic T is expectedly inferred)
-GNU_ATTRIBUTE_NORETURN GNU_ATTRIBUTE_COLD
-static void fire_error_calling_asm_function_with_non1_stack_width_arg(FunctionPtr cur_f, SrcLocation loc, FunctionPtr fun_ref, const GenericsSubstitutions& substitutions, int arg_idx) {
-  fire(cur_f, loc, "can not call `" + fun_ref->as_human_readable() + "` with " + to_string(substitutions.nameT_at(arg_idx)) + "=" + substitutions.typeT_at(arg_idx)->as_human_readable() + ", because it occupies " + std::to_string(substitutions.typeT_at(arg_idx)->get_width_on_stack()) + " stack slots in TVM, not 1");
+static Error err_calling_asm_function_with_non1_stack_width_arg(FunctionPtr fun_ref, const GenericsSubstitutions& substitutions, int arg_idx) {
+  return err("can not call `{}` with {}={}, because it occupies {} stack slots in TVM, not 1",
+             fun_ref, substitutions.nameT_at(arg_idx), substitutions.typeT_at(arg_idx), substitutions.typeT_at(arg_idx)->get_width_on_stack());
 }
 
-// fire an error on `untypedTupleVar.0` when used without a hint
-GNU_ATTRIBUTE_NORETURN GNU_ATTRIBUTE_COLD
-static void fire_error_cannot_deduce_untyped_tuple_access(FunctionPtr cur_f, SrcLocation loc, int index) {
-  std::string idx_access = "<tuple>." + std::to_string(index);
-  fire(cur_f, loc, "can not deduce type of `" + idx_access + "`\neither assign it to variable like `var c: int = " + idx_access + "` or cast the result like `" + idx_access + " as int`");
+// make an error on using lateinit variable before definite assignment
+static Error err_using_lateinit_variable_uninitialized(std::string_view name) {
+  return err("using variable `{}` before it's definitely assigned", name);
 }
 
-// fire an error on using lateinit variable before definite assignment
-GNU_ATTRIBUTE_NORETURN GNU_ATTRIBUTE_COLD
-static void fire_error_using_lateinit_variable_uninitialized(FunctionPtr cur_f, SrcLocation loc, std::string_view name) {
-  fire(cur_f, loc, "using variable `" + static_cast<std::string>(name) + "` before it's definitely assigned");
-}
-
-// fire an error when `obj.f()`, method `f` not found, try to locate a method for another type
-GNU_ATTRIBUTE_NORETURN GNU_ATTRIBUTE_COLD
-static void fire_error_method_not_found(FunctionPtr cur_f, SrcLocation loc, TypePtr receiver_type, std::string_view method_name) {
-  if (std::vector<FunctionPtr> other = lookup_methods_with_name(method_name); !other.empty()) {
-    fire(cur_f, loc, "method `" + to_string(method_name) + "` not found for type " + to_string(receiver_type) + "\n(but it exists for type " + to_string(other.front()->receiver_type) + ")");
+// make an error when `obj.f()`, method `f` not found, try to locate a method for another type
+static Error err_method_or_field_not_found(TypePtr receiver_type, std::string_view field_name, bool called_as_method, bool is_static_dot) {
+  if (!called_as_method && is_static_dot && receiver_type->unwrap_alias()->try_as<TypeDataEnum>()) {
+    return err("member `{}` does not exist in enum `{}`", field_name, receiver_type);
   }
-  if (const Symbol* sym = lookup_global_symbol(method_name); sym && sym->try_as<FunctionPtr>()) {
-    fire(cur_f, loc, "method `" + to_string(method_name) + "` not found, but there is a global function named `" + to_string(method_name) + "`\n(a function should be called `foo(arg)`, not `arg.foo()`)");
+  if (!called_as_method && !is_static_dot && std::isdigit(field_name[0]) && receiver_type->unwrap_alias()->try_as<TypeDataArray>()) {
+    return err("use `array.get({})`, not `array.{}`", field_name, field_name);
   }
-  fire(cur_f, loc, "method `" + to_string(method_name) + "` not found");
+  if (!called_as_method && !is_static_dot) {
+    return err("field `{}` doesn't exist in type `{}`", field_name, receiver_type);
+  } 
+  if (std::vector<FunctionPtr> other = lookup_methods_with_name(field_name); !other.empty()) {
+    std::string candidate_receivers;
+    for (FunctionPtr m : other) {
+      if (!candidate_receivers.empty()) candidate_receivers += ", ";
+      candidate_receivers += "`";
+      candidate_receivers += m->receiver_type->as_human_readable();
+      candidate_receivers += "`";
+    }
+    return err("method `{}` not found for type `{}`\n(but it exists for {} {})", field_name, receiver_type, other.size() == 1 ? "type" : "types", candidate_receivers);
+  }
+  if (const Symbol* sym = lookup_global_symbol(field_name); sym && sym->try_as<FunctionPtr>()) {
+    return err("method `{}` not found, but there is a global function named `{}`\n(a function should be called `foo(arg)`, not `arg.foo()`)", field_name, field_name);
+  }
+  return err("method `{}` not found", field_name);
+}
+
+// make an error when can't deduce generic T for a type, e.g. `x is Wrapper` or `Maybe.create()` (T missing and non deducible)
+static Error err_cannot_deduce_genericT(TypePtr t_generic) {
+  return err("can not deduce type arguments for `{}`, provide them manually", t_generic);
 }
 
 // safe version of std::stoi that does not crash on long numbers
@@ -175,31 +159,41 @@ static bool try_parse_string_to_int(std::string_view str, int& out) {
   return result.ec == std::errc() && result.ptr == str.data() + str.size();
 }
 
-// helper function: given hint = `Ok<int> | Err<slice>` and struct `Ok`, return `Ok<int>`
-// example: `match (...) { Ok => ... }` we need to deduce `Ok<T>` based on subject
-static TypePtr try_pick_instantiated_generic_from_hint(TypePtr hint, StructPtr lookup_ref) {
-  // example: `var w: Ok<int> = Ok { ... }`, hint is `Ok<int>`, lookup is `Ok`
-  if (const TypeDataStruct* h_struct = hint->unwrap_alias()->try_as<TypeDataStruct>()) {
-    if (lookup_ref == h_struct->struct_ref->base_struct_ref) {
-      return h_struct;
+// type hints from a user help inferring template arguments, object literal structs, etc.
+// they occur in variables `var v: hint = ...`, parameters `fun f(v: hint)`, return values `fun f(): hint`, etc.
+// example: `var v: (int, Point) = (2, {})` hint is a tensor, 1-th component `Point` infers `{}`
+template<class TypeT>
+static const TypeT* try_pick_T_from_hint(TypePtr hint, const std::function<bool(const TypeT*)>& optional_callback = nullptr) {
+  hint = hint->unwrap_alias();
+  // if hint is what we look for: `var v: Point` / `fun f(): Point`
+  if (const TypeT* converted = hint->try_as<TypeT>()) {
+    if (!optional_callback || optional_callback(converted)) {
+      return converted;
     }
   }
-  // example: `fun f(): Response<int, slice> { return Err { ... } }`, hint is `Ok<int> | Err<slice>`, lookup is `Err`
-  if (const TypeDataUnion* h_union = hint->unwrap_alias()->try_as<TypeDataUnion>()) {
-    TypePtr only_variant = nullptr;   // hint `Ok<int8> | Ok<int16>` is ambiguous
-    for (TypePtr h_variant : h_union->variants) {
-      if (const TypeDataStruct* variant_struct = h_variant->unwrap_alias()->try_as<TypeDataStruct>()) {
-        if (lookup_ref == variant_struct->struct_ref->base_struct_ref) {
-          if (only_variant) {
-            return nullptr;
-          }
-          only_variant = variant_struct;
+  // if hint is inside a union: `var v: Point | int` / `fun f(): Point?`
+  if (const TypeDataUnion* hint_union = hint->try_as<TypeDataUnion>()) {
+    const TypeT* only_variant = nullptr;
+    for (TypePtr variant : hint_union->variants) {
+      if (const TypeT* ok_variant = try_pick_T_from_hint<TypeT>(variant, optional_callback)) {
+        if (only_variant) {   // but `var v: Point | AnotherStruct` is ambiguous
+          return nullptr;
         }
+        only_variant = ok_variant;
       }
     }
     return only_variant;
   }
   return nullptr;
+}
+
+// helper function: given hint = `Ok<int> | Err<slice>` and struct `Ok`, return `Ok<int>`
+// example: `match (...) { Ok => ... }` we need to deduce `Ok<T>` based on subject
+// example: `fun f(): Response<int, slice> { return Err { ... } }`, hint is `Ok<int> | Err<slice>`, lookup is `Err`
+static TypePtr try_pick_instantiated_generic_from_hint(TypePtr hint, StructPtr lookup_ref) {
+  return try_pick_T_from_hint<TypeDataStruct>(hint, [lookup_ref](const TypeDataStruct* check) {
+    return lookup_ref == check->struct_ref->base_struct_ref;
+  });
 }
 
 // helper function, similar to the above, but for generic type aliases
@@ -223,35 +217,36 @@ static TypePtr try_pick_instantiated_generic_from_hint(TypePtr hint, AliasDefPtr
 
 // given `p.create` (called_receiver = Point, called_name = "create")
 // look up a corresponding method (it may be `Point.create` / `Point?.create` / `T.create`)
-static MethodCallCandidate choose_only_method_to_call(FunctionPtr cur_f, SrcLocation loc, TypePtr called_receiver, std::string_view called_name) {
-  // most practical cases: `builder.storeInt` etc., when a direct method for receiver exists
-  if (FunctionPtr exact_method = match_exact_method_for_call_not_generic(called_receiver, called_name)) {
-    return {exact_method, GenericsSubstitutions(exact_method->genericTs)};
-  }
-
-  // else, try to match, for example `10.copy` with `int?.copy`, with `T.copy`, etc.
-  std::vector<MethodCallCandidate> candidates = match_methods_for_call_including_generic(called_receiver, called_name);
+static std::pair<FunctionPtr, GenericsSubstitutions> choose_only_method_to_call(FunctionPtr cur_f, SrcRange range, TypePtr called_receiver, std::string_view called_name) {
+  std::vector<MethodCallCandidate> candidates = resolve_methods_for_call(called_receiver, called_name, true);
   if (candidates.size() == 1) {
-    return candidates[0];
+    return {candidates[0].method_ref, candidates[0].substitutedTs};
   }
   if (candidates.empty()) {   // return nullptr, the caller side decides how to react on this
     return {nullptr, GenericsSubstitutions(nullptr)};
   }
 
   std::ostringstream msg;
-  msg << "call to method `" << called_name << "` for type `" << called_receiver << "` is ambiguous\n";
-  for (const auto& [method_ref, substitutedTs] : candidates) {
+  msg << "call to method `" << called_name << "` for type `" << called_receiver->as_human_readable() << "` is ambiguous\n";
+  for (const MethodCallCandidate& candidate : candidates) {
+    FunctionPtr method_ref = candidate.method_ref;
     msg << "candidate function: `" << method_ref->as_human_readable() << "`";
     if (method_ref->is_generic_function()) {
-      msg << " with " << substitutedTs.as_human_readable(false);
+      msg << " with " << candidate.substitutedTs.as_human_readable(false);
     }
-    if (method_ref->loc.is_defined()) {
-      msg << " (declared at " << method_ref->loc << ")\n";
-    } else if (method_ref->is_builtin_function()) {
+    if (method_ref->ident_anchor) {
+      msg << " (declared at " << method_ref->ident_anchor->range.stringify_start_location(false) << ")\n";
+    } else if (method_ref->is_builtin()) {
       msg << " (builtin)\n";
     }
   }
-  fire(cur_f, loc, msg.str());
+  err("{}", msg.str()).fire(range, cur_f);
+}
+
+static void check_no_unexpected_type_arguments(FunctionPtr cur_f, V<ast_instantiationT_list> v_instantiationTs) {
+  if (v_instantiationTs != nullptr) {
+    err("type arguments not expected here").fire(v_instantiationTs, cur_f);
+  }
 }
 
 // given fun `f` and a call `f(a,b,c)`, check that argument count is expected;
@@ -266,13 +261,13 @@ void check_arguments_count_at_fun_call(FunctionPtr cur_f, V<ast_function_call> v
   }
 
   if (!called_f->does_accept_self() && self_obj) {   // static method `Point.create(...)` called as `p.create()`
-    fire(cur_f, v->loc, "method " + to_string(called_f) + " can not be called via dot\n(it's a static method, it does not accept `self`)");
+    err("method `{}` can not be called via dot\n(it's a static method, it does not accept `self`)", called_f).fire(v->get_callee(), cur_f);
   }
   if (n_max_params < n_arguments) {
-    fire(cur_f, v->loc, "too many arguments in call to " + to_string(called_f) + ", expected " + std::to_string(n_max_params - delta_self) + ", have " + std::to_string(n_arguments - delta_self));
+    err("too many arguments in call to `{}`, expected {}, have {}", called_f, n_max_params - delta_self, n_arguments - delta_self).fire(v->get_arg_list(), cur_f);
   }
   if (n_arguments < n_min_params) {
-    fire(cur_f, v->loc, "too few arguments in call to " + to_string(called_f) + ", expected " + std::to_string(n_min_params - delta_self) + ", have " + std::to_string(n_arguments - delta_self));
+    err("too few arguments in call to `{}`, expected {}, have {}", called_f, n_min_params - delta_self, n_arguments - delta_self).fire(v->get_arg_list(), cur_f);
   }
 }
 
@@ -370,6 +365,8 @@ class InferTypesAndCallsAndFieldsVisitor final {
         return infer_binary_operator(v->as<ast_binary_operator>(), std::move(flow), used_as_condition);
       case ast_ternary_operator:
         return infer_ternary_operator(v->as<ast_ternary_operator>(), std::move(flow), used_as_condition, hint);
+      case ast_null_coalesce_operator:
+        return infer_null_coalesce_operator(v->as<ast_null_coalesce_operator>(), std::move(flow), used_as_condition, hint);
       case ast_cast_as_operator:
         return infer_cast_as_operator(v->as<ast_cast_as_operator>(), std::move(flow), used_as_condition);
       case ast_is_type_operator:
@@ -378,8 +375,6 @@ class InferTypesAndCallsAndFieldsVisitor final {
         return infer_not_null_operator(v->as<ast_not_null_operator>(), std::move(flow), used_as_condition);
       case ast_lazy_operator:
         return infer_lazy_operator(v->as<ast_lazy_operator>(), std::move(flow), used_as_condition);
-      case ast_parenthesized_expression:
-        return infer_parenthesized(v->as<ast_parenthesized_expression>(), std::move(flow), used_as_condition, hint);
       case ast_braced_expression:
         return infer_braced_expression(v->as<ast_braced_expression>(), std::move(flow), used_as_condition, hint);
       case ast_reference:
@@ -390,14 +385,16 @@ class InferTypesAndCallsAndFieldsVisitor final {
         return infer_function_call(v->as<ast_function_call>(), std::move(flow), used_as_condition, hint);
       case ast_tensor:
         return infer_tensor(v->as<ast_tensor>(), std::move(flow), used_as_condition, hint);
-      case ast_bracket_tuple:
-        return infer_typed_tuple(v->as<ast_bracket_tuple>(), std::move(flow), used_as_condition, hint);
+      case ast_square_brackets:
+        return infer_square_brackets(v->as<ast_square_brackets>(), std::move(flow), used_as_condition, hint);
       case ast_null_keyword:
         return infer_null_keyword(v->as<ast_null_keyword>(), std::move(flow), used_as_condition);
       case ast_match_expression:
         return infer_match_expression(v->as<ast_match_expression>(), std::move(flow), used_as_condition, hint);
       case ast_object_literal:
         return infer_object_literal(v->as<ast_object_literal>(), std::move(flow), used_as_condition, hint);
+      case ast_lambda_fun:
+        return infer_lambda_fun(v->as<ast_lambda_fun>(), std::move(flow), used_as_condition, hint);
       case ast_underscore:
         return infer_underscore(v->as<ast_underscore>(), std::move(flow), used_as_condition, hint);
       case ast_empty_expression:
@@ -422,7 +419,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
   }
 
   static ExprFlow infer_string_const(V<ast_string_const> v, FlowContext&& flow, bool used_as_condition) {
-    assign_inferred_type(v, TypeDataSlice::create());
+    assign_inferred_type(v, TypeDataString::create());
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
@@ -440,23 +437,17 @@ class InferTypesAndCallsAndFieldsVisitor final {
     return after_v;
   }
 
-  ExprFlow infer_local_vars_declaration(V<ast_local_vars_declaration> v, FlowContext&& flow, bool used_as_condition) {
-    flow = infer_any_expr(v->get_expr(), std::move(flow), used_as_condition).out_flow;
-    assign_inferred_type(v, v->get_expr());
-    return ExprFlow(std::move(flow), used_as_condition);
+  static ExprFlow infer_local_vars_declaration(V<ast_local_vars_declaration> v, FlowContext&& flow, bool used_as_condition) {
+    tolk_assert(false);   // handled at assignment, because `var x = rhs` is an assignment
   }
 
   static ExprFlow infer_local_var_lhs(V<ast_local_var_lhs> v, FlowContext&& flow, bool used_as_condition) {
     // `var v = rhs`, inferring is called for `v`
     // at the moment of inferring left side of assignment, we don't know type of rhs (since lhs is executed first)
-    // so, mark `v` as unknown
+    // so, mark `v` as "not inferred"
     // later, v's inferred_type will be reassigned; see process_assignment_lhs_after_infer_rhs()
-    if (v->marked_as_redef) {
-      assign_inferred_type(v, v->var_ref->declared_type);
-    } else {
-      assign_inferred_type(v, v->type_node ? v->type_node->resolved_type : TypeDataUnknown::create());
-      flow.register_known_type(SinkExpression(v->var_ref), TypeDataUnknown::create());    // it's unknown before assigned
-    }
+    assign_inferred_type(v, v->type_node ? v->type_node->resolved_type : TypeDataNotInferred::create());
+    flow.register_known_type(SinkExpression(v->var_ref), TypeDataNotInferred::create());    // "not inferred" before assigned
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
@@ -480,7 +471,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
   // another example: `x.0 = rhs`, smart cast is dropped for `x.0` (not for `x`)
   // the goal of dropping smart casts is to have lhs->inferred_type as actually declared, used as hint to infer rhs
   FlowContext infer_left_side_of_assignment(AnyExprV lhs, FlowContext&& flow) {
-    if (auto lhs_tensor = lhs->try_as<ast_tensor>()) {
+    if (auto lhs_decl = lhs->try_as<ast_local_vars_declaration>()) {
+      flow = infer_left_side_of_assignment(lhs_decl->get_expr(), std::move(flow));
+      assign_inferred_type(lhs, lhs_decl->get_expr());
+
+    } else if (auto lhs_tensor = lhs->try_as<ast_tensor>()) {
       std::vector<TypePtr> types_list;
       types_list.reserve(lhs_tensor->size());
       for (int i = 0; i < lhs_tensor->size(); ++i) {
@@ -489,18 +484,14 @@ class InferTypesAndCallsAndFieldsVisitor final {
       }
       assign_inferred_type(lhs, TypeDataTensor::create(std::move(types_list)));
 
-    } else if (auto lhs_tuple = lhs->try_as<ast_bracket_tuple>()) {
+    } else if (auto lhs_square = lhs->try_as<ast_square_brackets>()) {
       std::vector<TypePtr> types_list;
-      types_list.reserve(lhs_tuple->size());
-      for (int i = 0; i < lhs_tuple->size(); ++i) {
-        flow = infer_left_side_of_assignment(lhs_tuple->get_item(i), std::move(flow));
-        types_list.push_back(lhs_tuple->get_item(i)->inferred_type);
+      types_list.reserve(lhs_square->size());
+      for (int i = 0; i < lhs_square->size(); ++i) {
+        flow = infer_left_side_of_assignment(lhs_square->get_item(i), std::move(flow));
+        types_list.push_back(lhs_square->get_item(i)->inferred_type);
       }
-      assign_inferred_type(lhs, TypeDataBrackets::create(std::move(types_list)));
-
-    } else if (auto lhs_par = lhs->try_as<ast_parenthesized_expression>()) {
-      flow = infer_left_side_of_assignment(lhs_par->get_expr(), std::move(flow));
-      assign_inferred_type(lhs, lhs_par->get_expr()->inferred_type);
+      assign_inferred_type(lhs, TypeDataShapedTuple::create(std::move(types_list)));
 
     } else {
       flow = infer_any_expr(lhs, std::move(flow), false).out_flow;
@@ -529,14 +520,14 @@ class InferTypesAndCallsAndFieldsVisitor final {
       return;
     }
 
-    // inside `var v: int = rhs` / `var _ = rhs` / `var v redef = rhs` (lhs is "v" / "_" / "v")
+    // inside `var v: int = rhs` / `var _ = rhs` (lhs is "v" / "_")
     if (auto lhs_var = lhs->try_as<ast_local_var_lhs>()) {
-      TypePtr declared_type = lhs_var->marked_as_redef ? lhs_var->var_ref->declared_type : lhs_var->type_node ? lhs_var->type_node->resolved_type : nullptr;
-      if (lhs_var->inferred_type == TypeDataUnknown::create()) {
+      TypePtr declared_type = lhs_var->type_node ? lhs_var->type_node->resolved_type : nullptr;
+      if (!declared_type) {
         assign_inferred_type(lhs_var, rhs_type);
         assign_inferred_type(lhs_var->var_ref, rhs_type);
       }
-      TypePtr smart_casted_type = declared_type && rhs_type != TypeDataUnknown::create() ? calc_smart_cast_type_on_assignment(declared_type, rhs_type) : rhs_type;
+      TypePtr smart_casted_type = declared_type ? calc_smart_cast_type_on_assignment(declared_type, rhs_type) : rhs_type;
       out_flow.register_known_type(SinkExpression(lhs_var->var_ref), smart_casted_type);
       return;
     }
@@ -548,7 +539,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
       std::vector<TypePtr> types_list;
       types_list.reserve(lhs_tensor->size());
       for (int i = 0; i < lhs_tensor->size(); ++i) {
-        TypePtr ith_rhs_type = rhs_type_tensor && i < rhs_type_tensor->size() ? rhs_type_tensor->items[i] : TypeDataUnknown::create();
+        TypePtr ith_rhs_type = rhs_type_tensor && i < rhs_type_tensor->size() ? rhs_type_tensor->items[i] : TypeDataNotInferred::create();
         process_assignment_lhs_after_infer_rhs(lhs_tensor->get_item(i), ith_rhs_type, out_flow);
         types_list.push_back(lhs_tensor->get_item(i)->inferred_type);
       }
@@ -558,23 +549,16 @@ class InferTypesAndCallsAndFieldsVisitor final {
 
     // `[v1, v2] = rhs` / `var [v1, v2] = rhs` (rhs may be `[1,2]` or `tupleVar` or `someF()`, doesn't matter)
     // dig recursively into v1 and v2 with corresponding rhs i-th item of a tuple
-    if (auto lhs_tuple = lhs->try_as<ast_bracket_tuple>()) {
-      const TypeDataBrackets* rhs_type_tuple = rhs_type->unwrap_alias()->try_as<TypeDataBrackets>();
+    if (auto lhs_square = lhs->try_as<ast_square_brackets>()) {
+      const TypeDataShapedTuple* rhs_type_shaped = rhs_type->unwrap_alias()->try_as<TypeDataShapedTuple>();
       std::vector<TypePtr> types_list;
-      types_list.reserve(lhs_tuple->size());
-      for (int i = 0; i < lhs_tuple->size(); ++i) {
-        TypePtr ith_rhs_type = rhs_type_tuple && i < rhs_type_tuple->size() ? rhs_type_tuple->items[i] : TypeDataUnknown::create();
-        process_assignment_lhs_after_infer_rhs(lhs_tuple->get_item(i), ith_rhs_type, out_flow);
-        types_list.push_back(lhs_tuple->get_item(i)->inferred_type);
+      types_list.reserve(lhs_square->size());
+      for (int i = 0; i < lhs_square->size(); ++i) {
+        TypePtr ith_rhs_type = rhs_type_shaped && i < rhs_type_shaped->size() ? rhs_type_shaped->items[i] : TypeDataNotInferred::create();
+        process_assignment_lhs_after_infer_rhs(lhs_square->get_item(i), ith_rhs_type, out_flow);
+        types_list.push_back(lhs_square->get_item(i)->inferred_type);
       }
-      assign_inferred_type(lhs, TypeDataBrackets::create(std::move(types_list)));
-      return;
-    }
-
-    // `(v) = (rhs)`, just surrounded by parenthesis
-    if (auto lhs_par = lhs->try_as<ast_parenthesized_expression>()) {
-      process_assignment_lhs_after_infer_rhs(lhs_par->get_expr(), rhs_type, out_flow);
-      assign_inferred_type(lhs, lhs_par->get_expr());
+      assign_inferred_type(lhs, TypeDataShapedTuple::create(std::move(types_list)));
       return;
     }
 
@@ -689,7 +673,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
         assign_inferred_type(v, TypeDataBool::create());
         if (!used_as_condition) {
           FlowContext out_flow = FlowContext::merge_flow(std::move(after_lhs.true_flow), std::move(after_rhs.out_flow));
-          return ExprFlow(std::move(after_rhs.out_flow), false);
+          return ExprFlow(std::move(out_flow), false);
         }
         FlowContext out_flow = FlowContext::merge_flow(std::move(after_lhs.out_flow), std::move(after_rhs.out_flow));
         FlowContext true_flow = FlowContext::merge_flow(std::move(after_lhs.true_flow), std::move(after_rhs.true_flow));
@@ -732,21 +716,65 @@ class InferTypesAndCallsAndFieldsVisitor final {
       return after_false;
     }
 
-    TypeInferringUnifyStrategy branches_unifier;
-    branches_unifier.unify_with(v->get_when_true()->inferred_type, hint);
-    branches_unifier.unify_with(v->get_when_false()->inferred_type, hint);
-    if (branches_unifier.is_union_of_different_types()) {
+    TypeInferringUnifyStrategy branches_unifier(hint);
+    branches_unifier.unify_with(v->get_when_true()->inferred_type);
+    branches_unifier.unify_with(v->get_when_false()->inferred_type);
+    if (branches_unifier.became_union_without_hint()) {
       // `... ? intVar : sliceVar` results in `int | slice`, probably it's not what the user expected
-      // example: `var v = ternary`, show an inference error
-      // do NOT show an error for `var v: T = ternary` (T is hint); it will be checked by type checker later
-      if (hint == nullptr || hint == TypeDataUnknown::create() || hint->has_genericT_inside()) {
-        fire(cur_f, v->loc, "types of ternary branches are incompatible: " + to_string(v->get_when_true()) + " and " + to_string(v->get_when_false()) + "\nhint: maybe, you should use `<some_expr> as <type>` to make them identical");
-      }
+      // but do NOT show an error for `var v: T = ternary` (T is hint); it will be checked by type checker later
+      err("types of ternary branches are incompatible: `{}` and `{}`\n""hint: maybe, you should use `<some_expr> as <type>` to make them identical", v->get_when_true()->inferred_type, v->get_when_false()->inferred_type).fire(v, cur_f);
     }
     assign_inferred_type(v, branches_unifier.get_result());
 
     FlowContext out_flow = FlowContext::merge_flow(std::move(after_true.out_flow), std::move(after_false.out_flow));
-    return ExprFlow(std::move(out_flow), std::move(after_true.true_flow), std::move(after_false.false_flow));
+    FlowContext true_flow = FlowContext::merge_flow(std::move(after_true.true_flow), std::move(after_false.true_flow));
+    FlowContext false_flow = FlowContext::merge_flow(std::move(after_true.false_flow), std::move(after_false.false_flow));
+    return ExprFlow(std::move(out_flow), std::move(true_flow), std::move(false_flow));
+  }
+
+  ExprFlow infer_null_coalesce_operator(V<ast_null_coalesce_operator> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
+    flow = infer_any_expr(v->get_lhs(), std::move(flow), false, hint).out_flow;
+
+    TypePtr lhs_type = v->get_lhs()->inferred_type;
+    TypePtr without_null_type = calculate_type_subtract_rhs_type(lhs_type, TypeDataNullLiteral::create());
+
+    FlowContext rhs_flow = flow.clone();
+    if (lhs_type == TypeDataNullLiteral::create()) {
+      // `null ?? rhs` — lhs is always null, rhs is always executed, the non-null branch is unreachable
+      flow.mark_unreachable(UnreachableKind::CantHappen);
+    } else if (without_null_type == TypeDataNever::create()) {
+      // `1 ?? rhs` — lhs can never be null, rhs is never executed
+      rhs_flow.mark_unreachable(UnreachableKind::CantHappen);
+    } else {
+      // regular situation: in the lhs branch, lhs was non-null; calculate rhs branch with lhs=null
+      if (SinkExpression s_expr = extract_sink_expression_from_vertex(v->get_lhs())) {
+        flow.register_known_type(s_expr, without_null_type);
+        rhs_flow.register_known_type(s_expr, TypeDataNullLiteral::create());
+      }
+    }
+    rhs_flow = infer_any_expr(v->get_rhs(), std::move(rhs_flow), false, hint).out_flow;
+
+    if (lhs_type == TypeDataNullLiteral::create()) {
+      // `null ?? rhs` — lhs is always null, rhs is always executed
+      assign_inferred_type(v, v->get_rhs());
+    } else if (without_null_type == TypeDataNever::create()) {
+      // `1 ?? rhs` — lhs can never be null, rhs is never executed
+      assign_inferred_type(v, v->get_lhs());
+    } else {
+      // regular situation: `lhs ?? rhs`, will generate a runtime branch
+      TypeInferringUnifyStrategy branches_unifier(hint);
+      branches_unifier.unify_with(without_null_type);
+      branches_unifier.unify_with(v->get_rhs()->inferred_type);
+      if (branches_unifier.became_union_without_hint()) {
+        // `nullableSlice ?? 0` results in `slice | int`, probably it's not what the user expected
+        // but do NOT show an error for `var v: T = ...` (T is hint); it will be checked by type checker later
+        err("type of operator `??` is `{}`; probably, it's not what you expected\n""assign it to a variable `var v: <type> = ... ?? ...` manually", branches_unifier.get_result()).fire(v, cur_f);
+      }
+      assign_inferred_type(v, branches_unifier.get_result());
+    }
+
+    flow = FlowContext::merge_flow(std::move(flow), std::move(rhs_flow));
+    return ExprFlow(std::move(flow), used_as_condition);
   }
 
   ExprFlow infer_cast_as_operator(V<ast_cast_as_operator> v, FlowContext&& flow, bool used_as_condition) {
@@ -772,7 +800,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
         rhs_type = inst_rhs_type;
         v->type_node->mutate()->assign_resolved_type(rhs_type);
       } else {
-        fire(cur_f, v->type_node->loc, "can not deduce type arguments for " + to_string(t_struct->struct_ref) + ", provide them manually");
+        err_cannot_deduce_genericT(t_struct).fire(v->type_node, cur_f);
       }
     }
     if (const auto* t_alias = rhs_type->try_as<TypeDataAlias>(); t_alias && t_alias->alias_ref->is_generic_alias()) {
@@ -781,12 +809,19 @@ class InferTypesAndCallsAndFieldsVisitor final {
         rhs_type = inst_rhs_type;
         v->type_node->mutate()->assign_resolved_type(rhs_type);
       } else {
-        fire(cur_f, v->type_node->loc, "can not deduce type arguments for " + to_string(t_alias->alias_ref) + ", provide them manually");
+        err_cannot_deduce_genericT(t_alias).fire(v->type_node, cur_f);
       }
     }
+    // we could also support auto-inferring type arguments for `v is map` and `v is array`,
+    // but it's more complicated than useful; maybe, think of simplifying "try_pick_*" in the future
+    if (const auto* t_map = rhs_type->try_as<TypeDataMapKV>(); t_map && t_map->has_genericT_inside()) {
+      err_cannot_deduce_genericT(rhs_type).fire(v->type_node, cur_f);
+    }
+    if (const auto* t_array = rhs_type->try_as<TypeDataArray>(); t_array && t_array->has_genericT_inside()) {
+      err_cannot_deduce_genericT(rhs_type).fire(v->type_node, cur_f);
+    }
 
-    rhs_type = rhs_type->unwrap_alias();
-    TypePtr expr_type = v->get_expr()->inferred_type->unwrap_alias();
+    TypePtr expr_type = v->get_expr()->inferred_type;
     TypePtr non_rhs_type = calculate_type_subtract_rhs_type(expr_type, rhs_type);
     if (expr_type->equal_to(rhs_type)) {                          // `expr is <type>` is always true
       v->mutate()->assign_always_true_or_false(v->is_negated ? 2 : 1);
@@ -823,7 +858,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
   ExprFlow infer_not_null_operator(V<ast_not_null_operator> v, FlowContext&& flow, bool used_as_condition) {
     ExprFlow after_expr = infer_any_expr(v->get_expr(), std::move(flow), false);
     TypePtr expr_type = v->get_expr()->inferred_type;
-    TypePtr without_null_type = calculate_type_subtract_rhs_type(expr_type->unwrap_alias(), TypeDataNullLiteral::create());
+    TypePtr without_null_type = calculate_type_subtract_rhs_type(expr_type, TypeDataNullLiteral::create());
     assign_inferred_type(v, without_null_type != TypeDataNever::create() ? without_null_type : expr_type);
 
     if (!used_as_condition) {
@@ -836,12 +871,6 @@ class InferTypesAndCallsAndFieldsVisitor final {
     ExprFlow lazy_expr = infer_any_expr(v->get_expr(), std::move(flow), used_as_condition);
     assign_inferred_type(v, v->get_expr());   // there is no Lazy<T>, so `lazy expr` is just typeof expr
     return lazy_expr;
-  }
-
-  ExprFlow infer_parenthesized(V<ast_parenthesized_expression> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
-    ExprFlow after_expr = infer_any_expr(v->get_expr(), std::move(flow), used_as_condition, hint);
-    assign_inferred_type(v, v->get_expr());
-    return after_expr;
   }
 
   ExprFlow infer_braced_expression(V<ast_braced_expression> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
@@ -866,18 +895,21 @@ class InferTypesAndCallsAndFieldsVisitor final {
   // given `genericF<int, slice>` / `t.tupleFirst<cell>` (the user manually specified instantiation Ts),
   // validate and collect them
   // returns: [int, slice] / [cell]
-  std::vector<TypePtr> collect_type_arguments_for_fun(SrcLocation loc, const GenericsDeclaration* genericTs, V<ast_instantiationT_list> instantiationT_list) const {
+  std::vector<TypePtr> collect_type_arguments_for_fun(const GenericsDeclaration* genericTs, V<ast_instantiationT_list> instantiationT_list) const {
     // for `genericF<T1,T2>` user should provide two Ts
+    // for `genericF<T1,T2>` where T2 has a default — one T1
     // for `Container<T>.wrap<U>` — one U (and one T is implicitly from receiver)
-    if (instantiationT_list->size() != genericTs->size() - genericTs->n_from_receiver) {
-      fire(cur_f, loc, "expected " + std::to_string(genericTs->size() - genericTs->n_from_receiver) + " type arguments, got " + std::to_string(instantiationT_list->size()));
+    int n_provided = instantiationT_list->size() + genericTs->n_from_receiver; 
+    if (n_provided < genericTs->size_no_defaults() || n_provided > genericTs->size()) {
+      err("expected {} type arguments, got {}", genericTs->size() - genericTs->n_from_receiver, instantiationT_list->size()).fire(instantiationT_list, cur_f);
     }
 
     std::vector<TypePtr> type_arguments;
-    type_arguments.reserve(instantiationT_list->size());
+    type_arguments.reserve(genericTs->size());
     for (int i = 0; i < instantiationT_list->size(); ++i) {
       type_arguments.push_back(instantiationT_list->get_item(i)->type_node->resolved_type);
     }
+    genericTs->append_defaults(type_arguments);
 
     return type_arguments;
   }
@@ -887,12 +919,12 @@ class InferTypesAndCallsAndFieldsVisitor final {
   // example: was `t.push<slice>(2)`, collected <slice>, instantiate `tuple.push<slice>` (will later fail type check)
   // example: was `var cb = t.first<int>;` (used as reference, as non-call), instantiate `tuple.first<int>`
   // returns fun_ref to instantiated function
-  FunctionPtr check_and_instantiate_generic_function(SrcLocation loc, FunctionPtr fun_ref, GenericsSubstitutions&& substitutedTs) const {
+  FunctionPtr check_and_instantiate_generic_function(SrcRange range, FunctionPtr fun_ref, GenericsSubstitutions&& substitutedTs) const {
     // T for asm function must be a TVM primitive (width 1), otherwise, asm would act incorrectly
-    if (fun_ref->is_asm_function() || fun_ref->is_builtin_function()) {
+    if (fun_ref->is_asm_function() || fun_ref->is_builtin()) {
       for (int i = 0; i < substitutedTs.size(); ++i) {
-        if (substitutedTs.typeT_at(i)->get_width_on_stack() != 1 && !fun_ref->is_variadic_width_T_allowed()) {
-          fire_error_calling_asm_function_with_non1_stack_width_arg(cur_f, loc, fun_ref, substitutedTs, i);
+        if (substitutedTs.typeT_at(i)->get_width_on_stack() != 1 && !is_allowed_asm_generic_function_with_non1_width_T(fun_ref, i)) {
+          err_calling_asm_function_with_non1_stack_width_arg(fun_ref, substitutedTs, i).fire(range, cur_f);
         }
       }
     }
@@ -907,11 +939,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
     // - or inside a call: `globalF()` / `genericFn()` / `genericFn<int>()` / `local_var()`
 
     if (LocalVarPtr var_ref = v->sym->try_as<LocalVarPtr>()) {
-      TypePtr declared_or_smart_casted = flow.smart_cast_if_exists(SinkExpression(var_ref));
-      tolk_assert(declared_or_smart_casted != nullptr);   // all local vars are presented in flow
+      tolk_assert(flow.smart_cast_exists(SinkExpression(var_ref)));   // all local vars are presented in flow
+      TypePtr declared_or_smart_casted = flow.smart_cast_or_original(SinkExpression(var_ref), var_ref->declared_type);
       assign_inferred_type(v, declared_or_smart_casted);
-      if (var_ref->is_lateinit() && declared_or_smart_casted == TypeDataUnknown::create() && v->is_rvalue) {
-        fire_error_using_lateinit_variable_uninitialized(cur_f, v->loc, v->get_name());
+      if (var_ref->is_lateinit() && declared_or_smart_casted == TypeDataNotInferred::create() && v->is_rvalue) {
+        err_using_lateinit_variable_uninitialized(v->get_name()).fire(v, cur_f);
       }
       // it might be `local_var()` also, don't fill out_f_called, we have no fun_ref, it's a call of arbitrary expression
 
@@ -932,29 +964,29 @@ class InferTypesAndCallsAndFieldsVisitor final {
 
       if (fun_ref->is_generic_function() && !v_instantiationTs && !out_f_called) {
         // `genericFn` is invalid as non-call, can't be used without <instantiation>
-        fire(cur_f, v->loc, "can not use a generic function " + to_string(fun_ref) + " as non-call");
+        err("can not use a generic function `{}` as non-call", fun_ref).fire(v, cur_f);
 
       } else if (fun_ref->is_generic_function() && v_instantiationTs) {
         // `genericFn<int>` is valid as non-call, it's a reference to instantiation
         // `genericFn<int>()` is also ok, we'll assign an instantiated fun_ref to out_f_called
         GenericsSubstitutions substitutedTs(fun_ref->genericTs);
-        substitutedTs.provide_type_arguments(collect_type_arguments_for_fun(v->loc, fun_ref->genericTs, v_instantiationTs));
-        fun_ref = check_and_instantiate_generic_function(v->loc, fun_ref, std::move(substitutedTs));
+        substitutedTs.provide_type_arguments(collect_type_arguments_for_fun(fun_ref->genericTs, v_instantiationTs));
+        fun_ref = check_and_instantiate_generic_function(v->range, fun_ref, std::move(substitutedTs));
         v->mutate()->assign_sym(fun_ref);
 
-      } else if (UNLIKELY(v_instantiationTs != nullptr)) {
+      } else {
         // non-generic function referenced like `return beginCell<builder>;`
-        fire(cur_f, v_instantiationTs->loc, "type arguments not expected here");
+        check_no_unexpected_type_arguments(cur_f, v_instantiationTs);
       }
 
       if (out_f_called) {           // so, it's `globalF()` / `genericFn()` / `genericFn<int>()`
         *out_f_called = fun_ref;    // (it's still may be a generic one, then Ts will be deduced from arguments)
       } else {                      // so, it's `globalF` / `genericFn<int>` as a reference
         if (fun_ref->is_compile_time_const_val() || fun_ref->is_compile_time_special_gen()) {
-          fire(cur_f, v->loc, "can not get reference to this function, it's compile-time only");
+          err("can not get reference to this function, it's compile-time only").fire(v, cur_f);
         }
         if (fun_ref->is_entrypoint()) {
-          fire(cur_f, v->loc, "can not get reference to this function, it's a special entrypoint");
+          err("can not get reference to this function, it's a special entrypoint").fire(v, cur_f);
         }
         fun_ref->mutate()->assign_is_used_as_noncall();
         get_or_infer_return_type(fun_ref);
@@ -967,9 +999,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
     }
 
     // for non-functions: `local_var<int>` and similar not allowed
-    if (UNLIKELY(v->has_instantiationTs())) {
-      fire(cur_f, v->get_instantiationTs()->loc, "type arguments not expected here");
-    }
+    check_no_unexpected_type_arguments(cur_f, v->get_instantiationTs());
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
@@ -982,14 +1012,41 @@ class InferTypesAndCallsAndFieldsVisitor final {
     FunctionPtr fun_ref = nullptr;  // to be filled for `<any_expr>.method` / `Point.create` (both standalone or in a call)
     GenericsSubstitutions substitutedTs(nullptr);
     V<ast_identifier> v_ident = v->get_identifier();    // field/method name vertex
+    V<ast_instantiationT_list> v_instantiationTs = v->get_instantiationTs();
+    std::string_view field_name = v_ident->name;
 
-    // handle `Point.create` / `Container<int>.wrap`: no dot_obj expression actually, lhs is a type, looking up a method
+    // handle `Point.create` / `Container<int>.wrap` / `Color.Red`: lhs is a type, looking up a constant/method
     if (auto obj_ref = v->get_obj()->try_as<ast_reference>()) {
       if (const auto* obj_as_type = obj_ref->sym->try_as<const TypeReferenceUsedAsSymbol*>()) {
         TypePtr receiver_type = obj_as_type->resolved_type;
-        std::tie(fun_ref, substitutedTs) = choose_only_method_to_call(cur_f, v_ident->loc, receiver_type, v->get_field_name());
+        // `Color.Red` (enum member) — just fill v->target and done
+        if (const TypeDataEnum* enum_receiver = receiver_type->unwrap_alias()->try_as<TypeDataEnum>()) {
+          if (EnumMemberPtr member_ref = enum_receiver->enum_ref->find_member(field_name)) {
+            v->mutate()->assign_target(member_ref);
+            check_no_unexpected_type_arguments(cur_f, v_instantiationTs);
+            assign_inferred_type(v, enum_receiver);   // `Color.Red` is `Color`
+            return ExprFlow(std::move(flow), used_as_condition);
+          }
+        }
+        // `Maybe.value(123)` or `Maybe.none()` where it's a generic `type Maybe<T>`
+        if (const TypeDataAlias* r_aliasT = receiver_type->try_as<TypeDataAlias>(); r_aliasT && r_aliasT->alias_ref->is_generic_alias()) {
+          if (const TypeDataAlias* hint_same = hint ? hint->try_as<TypeDataAlias>() : nullptr; hint_same && hint_same->alias_ref->base_alias_ref == r_aliasT->alias_ref) {
+            receiver_type = hint;   // assigned to `var v: Maybe<int> = Maybe.none()` or similar same hint
+          } else {
+            err_cannot_deduce_genericT(r_aliasT).fire(v->get_obj(), cur_f);
+          }
+        }
+        // `Pair.create(a, b)` where it's a generic `struct Pair<T1, T2>`
+        if (const TypeDataStruct* r_structT = receiver_type->unwrap_alias()->try_as<TypeDataStruct>(); r_structT && r_structT->struct_ref->is_generic_struct()) {
+          if (const TypeDataStruct* hint_same = hint ? hint->unwrap_alias()->try_as<TypeDataStruct>() : nullptr; hint_same && hint_same->struct_ref->base_struct_ref == r_structT->struct_ref) {
+            receiver_type = hint;   // assigned to `var p: Pair<int, bool> = Pair.create(...)`
+          } else {
+            err_cannot_deduce_genericT(r_structT).fire(v->get_obj(), cur_f);
+          }
+        }
+        std::tie(fun_ref, substitutedTs) = choose_only_method_to_call(cur_f, v_ident->range, receiver_type, field_name);
         if (!fun_ref) {
-          fire(cur_f, v_ident->loc, "method `" + to_string(v->get_field_name()) + "` not found for type " + to_string(receiver_type));
+          err_method_or_field_not_found(receiver_type, field_name, out_f_called != nullptr, true).fire(v_ident, cur_f);
         }
       }
     }
@@ -1000,9 +1057,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
     }
 
     // our goal is to fill v->target (field/index/method) knowing type of obj
-    TypePtr obj_type = dot_obj ? dot_obj->inferred_type->unwrap_alias() : TypeDataUnknown::create();
-    V<ast_instantiationT_list> v_instantiationTs = v->get_instantiationTs();
-    std::string_view field_name = v_ident->name;
+    TypePtr obj_type = dot_obj ? dot_obj->inferred_type->unwrap_alias() : TypeDataNotInferred::create();
 
     // check for field access (`user.id`), when obj is a struct
     if (const TypeDataStruct* obj_struct = obj_type->try_as<TypeDataStruct>()) {
@@ -1010,62 +1065,43 @@ class InferTypesAndCallsAndFieldsVisitor final {
         v->mutate()->assign_target(field_ref);
         TypePtr inferred_type = field_ref->declared_type;
         if (SinkExpression s_expr = extract_sink_expression_from_vertex(v)) {
-          if (TypePtr smart_casted = flow.smart_cast_if_exists(s_expr)) {
-            inferred_type = smart_casted;
-          }
+          inferred_type = flow.smart_cast_or_original(s_expr, inferred_type);
         }
+        check_no_unexpected_type_arguments(cur_f, v_instantiationTs);
         assign_inferred_type(v, inferred_type);
         return ExprFlow(std::move(flow), used_as_condition);
       }
       // if field_name doesn't exist, don't fire an error now — maybe, it's `user.method()`
     }
 
-    // check for indexed access (`tensorVar.0` / `tupleVar.1`)
+    // check for indexed access (`tensorVar.0` / `tupleShaped.1`)
     if (!fun_ref && field_name[0] >= '0' && field_name[0] <= '9') {
       int index_at;
       if (!try_parse_string_to_int(field_name, index_at)) {
-        fire(cur_f, v_ident->loc, "invalid numeric index");
+        err("invalid numeric index").fire(v_ident, cur_f);
       }
       if (const auto* t_tensor = obj_type->try_as<TypeDataTensor>()) {
         if (index_at >= t_tensor->size()) {
-          fire(cur_f, v_ident->loc, "invalid tensor index, expected 0.." + std::to_string(t_tensor->items.size() - 1));
+          err("invalid tensor index, expected 0..{}", t_tensor->size() - 1).fire(v_ident, cur_f);
         }
         v->mutate()->assign_target(index_at);
         TypePtr inferred_type = t_tensor->items[index_at];
         if (SinkExpression s_expr = extract_sink_expression_from_vertex(v)) {
-          if (TypePtr smart_casted = flow.smart_cast_if_exists(s_expr)) {
-            inferred_type = smart_casted;
-          }
+          inferred_type = flow.smart_cast_or_original(s_expr, inferred_type);
         }
         assign_inferred_type(v, inferred_type);
         return ExprFlow(std::move(flow), used_as_condition);
       }
-      if (const auto* t_tuple = obj_type->try_as<TypeDataBrackets>()) {
-        if (index_at >= t_tuple->size()) {
-          fire(cur_f, v_ident->loc, "invalid tuple index, expected 0.." + std::to_string(t_tuple->items.size() - 1));
+      if (const auto* t_shaped = obj_type->try_as<TypeDataShapedTuple>()) {
+        if (index_at >= t_shaped->size()) {
+          err("invalid array index, expected 0..{}", t_shaped->size() - 1).fire(v_ident, cur_f);
         }
         v->mutate()->assign_target(index_at);
-        TypePtr inferred_type = t_tuple->items[index_at];
+        TypePtr inferred_type = t_shaped->items[index_at];
         if (SinkExpression s_expr = extract_sink_expression_from_vertex(v)) {
-          if (TypePtr smart_casted = flow.smart_cast_if_exists(s_expr)) {
-            inferred_type = smart_casted;
-          }
+          inferred_type = flow.smart_cast_or_original(s_expr, inferred_type);
         }
         assign_inferred_type(v, inferred_type);
-        return ExprFlow(std::move(flow), used_as_condition);
-      }
-      if (obj_type->try_as<TypeDataTuple>()) {
-        TypePtr item_type = nullptr;
-        if (v->is_lvalue && !hint) {     // left side of assignment
-          item_type = TypeDataUnknown::create();
-        } else {
-          if (hint == nullptr || hint == TypeDataUnknown::create() || hint->has_genericT_inside()) {
-            fire_error_cannot_deduce_untyped_tuple_access(cur_f, v->loc, index_at);
-          }
-          item_type = hint;
-        }
-        v->mutate()->assign_target(index_at);
-        assign_inferred_type(v, item_type);
         return ExprFlow(std::move(flow), used_as_condition);
       }
     }
@@ -1073,7 +1109,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
     // check for method (`t.size` / `user.getId`); even `i.0()` can be here if `fun int.0(self)` exists
     // for `T.copy` / `Container<T>.create`, substitution for T is also returned
     if (!fun_ref) {
-      std::tie(fun_ref, substitutedTs) = choose_only_method_to_call(cur_f, dot_obj->loc, dot_obj->inferred_type, field_name);
+      std::tie(fun_ref, substitutedTs) = choose_only_method_to_call(cur_f, dot_obj->range, dot_obj->inferred_type, field_name);
     }
 
     // not a field, not a method — fire an error
@@ -1081,35 +1117,37 @@ class InferTypesAndCallsAndFieldsVisitor final {
       // as a special case, handle accessing fields of nullable objects, to show a more precise error
       if (const TypeDataUnion* as_union = obj_type->try_as<TypeDataUnion>(); as_union && as_union->or_null) {
         if (const TypeDataStruct* n_struct = as_union->or_null->try_as<TypeDataStruct>(); n_struct && n_struct->struct_ref->find_field(field_name)) {
-          fire(cur_f, v_ident->loc, "can not access field `" + static_cast<std::string>(field_name) + "` of a possibly nullable object " + to_string(dot_obj) + "\nhint: check it via `obj != null` or use non-null assertion `obj!` operator");
+          err("can not access field `{}` of a possibly nullable object `{}`\n""hint: check it via `obj != null` or use non-null assertion `obj!` operator", field_name, dot_obj->inferred_type).fire(v_ident, cur_f);
         }
       }
-      if (out_f_called) {
-        fire_error_method_not_found(cur_f, v_ident->loc, dot_obj->inferred_type, v->get_field_name());
-      } else {
-        fire(cur_f, v_ident->loc, "field `" + static_cast<std::string>(field_name) + "` doesn't exist in type " + to_string(dot_obj));
-      }
+      err_method_or_field_not_found(dot_obj->inferred_type, field_name, out_f_called != nullptr, false).fire(v_ident, cur_f);
+    }
+
+    // for methods (which are extension functions), `import` must exist, same as for regular functions/types
+    bool allow_no_import = fun_ref->is_builtin() || fun_ref->ident_anchor->range.is_file_id_same_or_stdlib_common(v->range);
+    if (!allow_no_import) {
+      fun_ref->check_import_exists_when_used_from(cur_f, v_ident);
     }
 
     // if `fun T.copy(self)` and reference `int.copy` — all generic parameters are determined by the receiver, we know it
     if (fun_ref->is_generic_function() && fun_ref->genericTs->size() == fun_ref->genericTs->n_from_receiver) {
       tolk_assert(substitutedTs.typeT_at(0) != nullptr);
-      fun_ref = check_and_instantiate_generic_function(v->loc, fun_ref, std::move(substitutedTs));
+      fun_ref = check_and_instantiate_generic_function(v->range, fun_ref, std::move(substitutedTs));
     }
 
     if (fun_ref->is_generic_function() && !v_instantiationTs && !out_f_called) {
       // `t.tupleAt` is invalid as non-call, can't be used without <instantiation>
-      fire(cur_f, v->loc, "can not use a generic function " + to_string(fun_ref) + " as non-call");
+      err("can not use a generic function `{}` as non-call", fun_ref).fire(v_ident, cur_f);
 
     } else if (fun_ref->is_generic_function() && v_instantiationTs) {
       // `t.tupleAt<int>` is valid as non-call, it's a reference to instantiation
       // `t.tupleAt<int>()` is also ok, we'll assign an instantiated fun_ref to out_f_called
-      substitutedTs.provide_type_arguments(collect_type_arguments_for_fun(v->loc, fun_ref->genericTs, v_instantiationTs));
-      fun_ref = check_and_instantiate_generic_function(v->loc, fun_ref, std::move(substitutedTs));
+      substitutedTs.provide_type_arguments(collect_type_arguments_for_fun(fun_ref->genericTs, v_instantiationTs));
+      fun_ref = check_and_instantiate_generic_function(v->range, fun_ref, std::move(substitutedTs));
 
-    } else if (UNLIKELY(v_instantiationTs != nullptr)) {
+    } else {
       // non-generic method referenced like `var cb = c.hash<int>;`
-      fire(cur_f, v_instantiationTs->loc, "type arguments not expected here");
+      check_no_unexpected_type_arguments(cur_f, v_instantiationTs);
     }
 
     if (out_f_called) {           // so, it's `user.method()` / `t.tupleAt()` / `t.tupleAt<int>()` / `Point.create`
@@ -1117,7 +1155,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
       *out_dot_obj = dot_obj;
     } else {                      // so, it's `user.method` / `t.tupleAt<int>` as a reference
       if (fun_ref->is_compile_time_const_val() || fun_ref->is_compile_time_special_gen()) {
-        fire(cur_f, v->get_identifier()->loc, "can not get reference to this method, it's compile-time only");
+        err("can not get reference to this method, it's compile-time only").fire(v_ident, cur_f);
       }
       fun_ref->mutate()->assign_is_used_as_noncall();
       v->mutate()->assign_target(fun_ref);
@@ -1137,7 +1175,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
     if (callee->kind == ast_reference) {
       flow = infer_reference(callee->as<ast_reference>(), std::move(flow), false, nullptr, &fun_ref).out_flow;
     } else if (callee->kind == ast_dot_access) {
-      flow = infer_dot_access(callee->as<ast_dot_access>(), std::move(flow), false, nullptr, &fun_ref, &self_obj).out_flow;
+      flow = infer_dot_access(callee->as<ast_dot_access>(), std::move(flow), false, hint, &fun_ref, &self_obj).out_flow;
     } else {
       flow = infer_any_expr(callee, std::move(flow), false).out_flow;
     }
@@ -1147,11 +1185,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
       // callee must have "callable" inferred type
       const TypeDataFunCallable* f_callable = callee->inferred_type->unwrap_alias()->try_as<TypeDataFunCallable>();
       if (!f_callable) {   // `5()` / `SOME_CONST()` / `null()`
-        fire(cur_f, v->loc, "calling a non-function " + to_string(callee->inferred_type));
+        err("calling a non-function `{}`", callee->inferred_type).fire(v->get_callee(), cur_f);
       }
       // check arguments count (their types will be checked in a later pipe)
       if (v->get_num_args() != static_cast<int>(f_callable->params_types.size())) {
-        fire(cur_f, v->loc, "expected " + std::to_string(f_callable->params_types.size()) + " arguments, got " + std::to_string(v->get_arg_list()->size()));
+        err("expected {} arguments, got {}", f_callable->params_types.size(), v->get_arg_list()->size()).fire(v->get_callee(), cur_f);
       }
       for (int i = 0; i < v->get_num_args(); ++i) {
         auto arg_i = v->get_arg(i)->get_expr();
@@ -1164,7 +1202,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
 
     // prevent calling `onBouncedMessage()` and other special functions directly
     if (fun_ref->is_entrypoint()) {
-      fire(cur_f, v->loc, fun_ref->name + " is a special entrypoint, it can not be called as a regular function");
+      err("{} is a special entrypoint, it can not be called as a regular function", fun_ref).fire(v->get_callee(), cur_f);
     }
 
     // so, we have a call `f(args)` or `obj.f(args)`, f is fun_ref (function / method) (code / asm / builtin)
@@ -1183,11 +1221,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
       const LocalVarData& param_0 = fun_ref->parameters[0];
       TypePtr param_type = param_0.declared_type;
       if (param_type->has_genericT_inside()) {
-        param_type = deducingTs.auto_deduce_from_argument(cur_f, self_obj->loc, param_type, self_obj->inferred_type);
+        param_type = deducingTs.auto_deduce_from_argument(cur_f, self_obj->range, param_type, self_obj->inferred_type);
       }
-      if (param_0.is_mutate_parameter() && self_obj->inferred_type->unwrap_alias() != param_type->unwrap_alias()) {
+      if (param_0.is_mutate_parameter()) {
         if (SinkExpression s_expr = extract_sink_expression_from_vertex(self_obj)) {
-          assign_inferred_type(self_obj, calc_declared_type_before_smart_cast(self_obj));
+          assign_inferred_type(self_obj, param_type);
           flow.register_known_type(s_expr, param_type);
         }
       }
@@ -1196,7 +1234,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
     if (!self_obj && fun_ref->receiver_type && fun_ref->receiver_type->has_genericT_inside() && callee->kind == ast_dot_access && callee->as<ast_dot_access>()->get_obj()->kind == ast_reference) {
       const auto* t_static = callee->as<ast_dot_access>()->get_obj()->as<ast_reference>()->sym->try_as<const TypeReferenceUsedAsSymbol*>();
       tolk_assert(t_static);
-      deducingTs.auto_deduce_from_argument(cur_f, v->loc, fun_ref->receiver_type, t_static->resolved_type);
+      deducingTs.auto_deduce_from_argument(cur_f, v->get_callee()->range, fun_ref->receiver_type, t_static->resolved_type);
     }
 
     // loop over every argument, one by one, like control flow goes
@@ -1209,13 +1247,13 @@ class InferTypesAndCallsAndFieldsVisitor final {
       }
       flow = infer_any_expr(arg_i, std::move(flow), false, param_type).out_flow;
       if (param_type->has_genericT_inside()) {    // `f(a)` where f is generic: use `a` to infer param type
-        param_type = deducingTs.auto_deduce_from_argument(cur_f, arg_i->loc, param_type, arg_i->inferred_type);
+        param_type = deducingTs.auto_deduce_from_argument(cur_f, arg_i->range, param_type, arg_i->inferred_type);
       }
       assign_inferred_type(v->get_arg(i), arg_i);  // arg itself is an expression
-      if (param_i.is_mutate_parameter() && arg_i->inferred_type->unwrap_alias() != param_type->unwrap_alias()) {
+      if (param_i.is_mutate_parameter()) {
         if (SinkExpression s_expr = extract_sink_expression_from_vertex(arg_i)) {
-          assign_inferred_type(arg_i, calc_declared_type_before_smart_cast(arg_i));
-          flow.register_known_type(s_expr, param_type);
+          assign_inferred_type(arg_i, param_type);      // note that we unconditionally set cur type = param's type
+          flow.register_known_type(s_expr, param_type); // (this mutate-back will be type checked in a later pass)
         }
       }
     }
@@ -1229,7 +1267,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
       if (!nameT_unknown.empty() && hint && !hint->has_genericT_inside() && fun_ref->declared_return_type) {
         // example: `t.tupleFirst()`, T doesn't depend on arguments, but is determined by return type
         // if used like `var x: int = t.tupleFirst()` / `t.tupleFirst() as int` / etc., use hint
-        deducingTs.auto_deduce_from_argument(cur_f, v->loc, fun_ref->declared_return_type, hint);
+        deducingTs.auto_deduce_from_argument(cur_f, v->get_callee()->range, fun_ref->declared_return_type, hint);
         nameT_unknown = deducingTs.get_first_not_deduced_nameT();
       }
       if (!nameT_unknown.empty()) {
@@ -1237,25 +1275,43 @@ class InferTypesAndCallsAndFieldsVisitor final {
         nameT_unknown = deducingTs.get_first_not_deduced_nameT();
       }
       if (!nameT_unknown.empty()) {
-        deducingTs.fire_error_can_not_deduce(cur_f, v->get_arg_list()->loc, nameT_unknown);
+        deducingTs.err_can_not_deduce(nameT_unknown).fire(v->get_callee(), cur_f);
       }
-      fun_ref = check_and_instantiate_generic_function(v->loc, fun_ref, deducingTs.flush());
+      fun_ref = check_and_instantiate_generic_function(v->get_callee()->range, fun_ref, deducingTs.flush());
     }
 
     // get return type either from user-specified declaration or infer here on demand traversing its body
     v->mutate()->assign_fun_ref(fun_ref, self_obj != nullptr);
     get_or_infer_return_type(fun_ref);
-    TypePtr inferred_type = fun_ref->does_return_self() ? self_obj->inferred_type : fun_ref->inferred_return_type;
+    TypePtr inferred_type = fun_ref->does_return_self() && self_obj ? self_obj->inferred_type : fun_ref->inferred_return_type;
     assign_inferred_type(v, inferred_type);
     assign_inferred_type(callee, fun_ref->inferred_full_type);
     if (inferred_type == TypeDataNever::create()) {
       flow.mark_unreachable(UnreachableKind::CallNeverReturnFunction);
     }
+
+    // calling `SomeStruct.toCell()` implicitly calls custom `packToBuilder()` serializers for nested fields,
+    // which may be generic and need to be instantiated here
+    if (fun_ref->is_builtin() && fun_ref->is_instantiation_of_generic_function()) {
+      TypePtr serialized_type = nullptr;
+      bool is_pack = true;
+      if (is_serialization_builtin_function(fun_ref, &serialized_type, &is_pack)) {
+        // use the traversing function that collects all nested types recursively (fields, tensor components, etc.)
+        std::vector<MethodCallCandidate> un_pack_candidates;
+        check_struct_can_be_packed_or_unpacked(serialized_type, is_pack, nullptr, &un_pack_candidates);
+        for (MethodCallCandidate c : un_pack_candidates) {
+          if (c.is_generic()) {
+            instantiate_generic_function(c.method_ref, std::move(c.substitutedTs));
+          }
+        }
+      }
+    }
+
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
   ExprFlow infer_tensor(V<ast_tensor> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
-    const TypeDataTensor* tensor_hint = hint ? hint->unwrap_alias()->try_as<TypeDataTensor>() : nullptr;
+    const TypeDataTensor* tensor_hint = hint ? try_pick_T_from_hint<TypeDataTensor>(hint) : nullptr;
     std::vector<TypePtr> types_list;
     types_list.reserve(v->get_items().size());
     for (int i = 0; i < v->size(); ++i) {
@@ -1263,20 +1319,83 @@ class InferTypesAndCallsAndFieldsVisitor final {
       flow = infer_any_expr(item, std::move(flow), false, tensor_hint && i < tensor_hint->size() ? tensor_hint->items[i] : nullptr).out_flow;
       types_list.emplace_back(item->inferred_type);
     }
+    if (types_list.size() >= 64) {
+      err("too big tensor (64 or more elements)").fire(v, cur_f);
+    }
     assign_inferred_type(v, TypeDataTensor::create(std::move(types_list)));
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
-  ExprFlow infer_typed_tuple(V<ast_bracket_tuple> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
-    const TypeDataBrackets* tuple_hint = hint ? hint->unwrap_alias()->try_as<TypeDataBrackets>() : nullptr;
+  ExprFlow infer_square_brackets(V<ast_square_brackets> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
+    // `array<int> []` / `lisp_list<int> [1,2,3]` / `tuple [1, "aba"]` / `map<int32, bool> []`
+    if (v->type_node) {
+      TypePtr provided_type = v->type_node->resolved_type->unwrap_alias();
+      bool is_valid_constructor = provided_type->try_as<TypeDataArray>()
+                              || (provided_type->try_as<TypeDataStruct>() && provided_type->try_as<TypeDataStruct>()->struct_ref->is_instantiation_of_LispListT())
+                              || (provided_type->try_as<TypeDataMapKV>());
+      if (is_valid_constructor) {
+        hint = v->type_node->resolved_type;
+      } else {
+        err("`{}` is not a valid constructor for `[...]`", v->type_node->resolved_type).fire(v->type_node, cur_f);
+      }
+    }
+
+    const TypeDataArray* hint_array = hint ? try_pick_T_from_hint<TypeDataArray>(hint) : nullptr;
+    const TypeDataShapedTuple* hint_shaped = hint ? try_pick_T_from_hint<TypeDataShapedTuple>(hint) : nullptr;
+    const TypeDataStruct* hint_lisp_list = hint ? try_pick_T_from_hint<TypeDataStruct>(hint, [](const TypeDataStruct* check) {
+      return check->struct_ref->is_instantiation_of_LispListT();
+    }) : nullptr;
+    const TypeDataMapKV* hint_mapKV = hint ? try_pick_T_from_hint<TypeDataMapKV>(hint) : nullptr;
+
     std::vector<TypePtr> types_list;
-    types_list.reserve(v->get_items().size());
+    types_list.reserve(v->size());
     for (int i = 0; i < v->size(); ++i) {
       AnyExprV item = v->get_item(i);
-      flow = infer_any_expr(item, std::move(flow), false, tuple_hint && i < tuple_hint->size() ? tuple_hint->items[i] : nullptr).out_flow;
+      TypePtr ith_hint = hint_array ? hint_array->innerT :
+                         hint_shaped && i < hint_shaped->size() ? hint_shaped->items[i] :
+                         hint_lisp_list ? hint_lisp_list->struct_ref->substitutedTs->typeT_at(0) :
+                         hint_mapKV ? TypeDataShapedTuple::create({hint_mapKV->TKey, hint_mapKV->TValue}) :
+                         nullptr;
+      flow = infer_any_expr(item, std::move(flow), false, ith_hint).out_flow;
       types_list.emplace_back(item->inferred_type);
     }
-    assign_inferred_type(v, TypeDataBrackets::create(std::move(types_list)));
+    if (types_list.size() >= 64) {
+      err("too big tuple (64 or more elements)").fire(v, cur_f);
+    }
+
+    if (v->type_node) {
+      // `array<int> []` / `tuple [1, "aba"]` — keep type_node as-is, preserving aliases
+      // if types are incompatible, like `array<int> [1, "aba"]`, it's reported later by a type checker
+      assign_inferred_type(v, v->type_node->resolved_type);
+    } else if (hint_array && !hint_array->has_genericT_inside()) {
+      // `var x: array<int> = [...]`, infer `[...]` as `array<int>`
+      assign_inferred_type(v, hint_array);
+    } else if (hint_lisp_list && !hint_lisp_list->has_genericT_inside()) {
+      // `var x: lisp_list<int> = [...]`, infer `[...]` as `lisp_list<int>`
+      assign_inferred_type(v, hint_lisp_list);
+    } else if (hint_mapKV && !hint_mapKV->has_genericT_inside()) {
+      // `var x: map<int32, bool> = []`
+      assign_inferred_type(v, hint_mapKV);
+    } else if (hint_shaped) {
+      // `var x: [int] = [0]` / `f([1,""])` (where f's param is `[int,string]`)
+      assign_inferred_type(v, TypeDataShapedTuple::create(std::move(types_list)));
+    } else if (v->empty()) {
+      // just `[]` is `array<unknown>`
+      assign_inferred_type(v, TypeDataArray::create(TypeDataUnknown::create()));
+    } else {
+      // for `[...]` without a hint, infer array<unified>, exactly as it's done for `return` or a ternary:
+      // - `[1,2,3]` is `array<int>`
+      // - `[1, null]` is `array<int?>`
+      // - `[1, "aba"]` is `array<int | string>`, and fire
+      TypeInferringUnifyStrategy unifier(nullptr);
+      for (int i = 0; i < v->size(); ++i) {
+        unifier.unify_with(types_list[i]);
+      }
+      if (unifier.became_union_without_hint()) {
+        err("type of `[...]` is `array<{}>`; probably, it's not what you expected\n""specify the array's type manually\n""example:\n""> var x = array<unknown> [...]", unifier.get_result()).fire(v, cur_f);
+      }
+      assign_inferred_type(v, TypeDataArray::create(unifier.get_result()));
+    }
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
@@ -1289,9 +1408,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
   ExprFlow infer_match_expression(V<ast_match_expression> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
     flow = infer_any_expr(v->get_subject(), std::move(flow), false).out_flow;
     SinkExpression s_expr = extract_sink_expression_from_vertex(v->get_subject());
-    TypeInferringUnifyStrategy branches_unifier;
+    TypePtr subject_type = v->get_subject()->inferred_type;
+    TypeInferringUnifyStrategy branches_unifier(hint);
     FlowContext arms_entry_facts = flow.clone();
     FlowContext match_out_flow;
+    bool has_type_arm = false;
     bool has_expr_arm = false;
     bool has_else_arm = false;
 
@@ -1306,7 +1427,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
             exact_type = inst_exact_type;
             v_arm->pattern_type_node->mutate()->assign_resolved_type(exact_type);
           } else {
-            fire(cur_f, v_arm->loc, "can not deduce type arguments for " + to_string(t_struct->struct_ref) + ", provide them manually");
+            err_cannot_deduce_genericT(t_struct).fire(v_arm->pattern_type_node, cur_f);
           }
         }
         if (const auto* t_alias = exact_type->try_as<TypeDataAlias>(); t_alias && t_alias->alias_ref->is_generic_alias()) {
@@ -1315,26 +1436,39 @@ class InferTypesAndCallsAndFieldsVisitor final {
             exact_type = inst_exact_type;
             v_arm->pattern_type_node->mutate()->assign_resolved_type(exact_type);
           } else {
-            fire(cur_f, v_arm->loc, "can not deduce type arguments for " + to_string(t_alias->alias_ref) + ", provide them manually");
+            err_cannot_deduce_genericT(t_alias).fire(v_arm->pattern_type_node, cur_f);
           }
         }
         arm_flow.register_known_type(s_expr, exact_type);
-
-      } else if (v_arm->pattern_kind == MatchArmKind::const_expression) {
-        has_expr_arm = true;
-      } else if (v_arm->pattern_kind == MatchArmKind::else_branch) {
-        has_else_arm = true;
       }
+
+      has_type_arm |= v_arm->pattern_kind == MatchArmKind::exact_type;
+      has_expr_arm |= v_arm->pattern_kind == MatchArmKind::const_expression;
+      has_else_arm |= v_arm->pattern_kind == MatchArmKind::else_branch;
 
       arm_flow = infer_any_expr(v_arm->get_body(), std::move(arm_flow), false, hint).out_flow;
       match_out_flow = i == 0 ? std::move(arm_flow) : FlowContext::merge_flow(std::move(match_out_flow), std::move(arm_flow));
-      branches_unifier.unify_with(v_arm->get_body()->inferred_type, hint);
+      branches_unifier.unify_with(v_arm->get_body()->inferred_type);
     }
     if (v->get_arms_count() == 0) {
       match_out_flow = std::move(arms_entry_facts);
     }
-    if (has_expr_arm && !has_else_arm) {
-      FlowContext else_flow = process_any_statement(createV<ast_empty_expression>(v->loc), std::move(arms_entry_facts));
+
+    // calculate if `match` is exhaustive if used correctly (correctness is checked later)
+    bool is_exhaustive = has_else_arm     // user-defined `else` branch
+                      || has_type_arm     // all possible types must be covered, checked in a later pipe
+                      || subject_type->unwrap_alias()->try_as<TypeDataEnum>();  // all enum members must be covered
+    // special case: `match (boolVar) { true => false => }`
+    if (subject_type == TypeDataBool::create() && v->get_arms_count() == 2 && has_expr_arm) {
+      auto arm0 = v->get_arm(0)->get_pattern_expr()->try_as<ast_bool_const>();
+      auto arm1 = v->get_arm(1)->get_pattern_expr()->try_as<ast_bool_const>();
+      is_exhaustive |= arm0 && arm1 && arm0->bool_val != arm1->bool_val;
+    }
+
+    v->mutate()->assign_is_exhaustive(is_exhaustive);
+    if (!is_exhaustive && v->get_arms_count()) {
+      // add implicit `else => {}` branch for control flow
+      FlowContext else_flow = process_any_statement(createV<ast_empty_expression>(SrcRange::empty_at_end(v->range)), std::move(arms_entry_facts));
       match_out_flow = FlowContext::merge_flow(std::move(match_out_flow), std::move(else_flow));
     }
 
@@ -1342,13 +1476,11 @@ class InferTypesAndCallsAndFieldsVisitor final {
       assign_inferred_type(v, TypeDataVoid::create());
     } else {
       if (v->get_arms_count() == 0) {     // still allow empty `match` statements, for probable codegen
-        fire(cur_f, v->loc, "empty `match` can't be used as expression");
+        err("empty `match` can't be used as expression").fire(v->keyword_range(), cur_f);
       }
-      if (branches_unifier.is_union_of_different_types()) {
+      if (branches_unifier.became_union_without_hint()) {
         // same as in ternary: `match (...) { t1 => someSlice, t2 => someInt }` is `int|slice`, probably unexpected
-        if (hint == nullptr || hint == TypeDataUnknown::create() || hint->has_genericT_inside()) {
-          fire(cur_f, v->loc, "type of `match` was inferred as " + to_string(branches_unifier.get_result()) + "; probably, it's not what you expected\nassign it to a variable `var v: <type> = match (...) { ... }` manually");
-        }
+        err("type of `match` was inferred as `{}`; probably, it's not what you expected\nassign it to a variable `var v: <type> = match (...) { ... }` manually", branches_unifier.get_result()).fire(v->keyword_range(), cur_f);
       }
       assign_inferred_type(v, branches_unifier.get_result());
     }
@@ -1370,7 +1502,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
         struct_ref = hint_instTs->struct_ref;     // if `type WAlias<T> = Wrapper<T>`, here `Wrapper` (generic struct)
       }
       if (!struct_ref) {
-        fire(cur_f, v->type_node->loc, to_string(v->type_node->resolved_type) + " does not name a struct");
+        err("`{}` does not name a struct", v->type_node->resolved_type).fire(v->type_node, cur_f);
       }
       // example: `var v: Ok<int> = Ok { ... }`, now struct_ref is "Ok<T>", take "Ok<int>" from hint
       if (struct_ref->is_generic_struct() && hint) {
@@ -1380,32 +1512,14 @@ class InferTypesAndCallsAndFieldsVisitor final {
       }
     }
     if (!struct_ref && hint) {
-      if (const TypeDataStruct* hint_struct = hint->unwrap_alias()->try_as<TypeDataStruct>()) {
-        struct_ref = hint_struct->struct_ref;
-      }
-      if (const TypeDataUnion* hint_union = hint->unwrap_alias()->try_as<TypeDataUnion>()) {
-        StructPtr last_struct = nullptr;
-        int n_structs = 0;
-        for (TypePtr variant : hint_union->variants) {
-          if (const TypeDataStruct* variant_struct = variant->unwrap_alias()->try_as<TypeDataStruct>()) {
-            last_struct = variant_struct->struct_ref;
-            n_structs++;
-          }
-          if (const TypeDataGenericTypeWithTs* hint_withTs = variant->unwrap_alias()->try_as<TypeDataGenericTypeWithTs>()) {
-            last_struct = hint_withTs->struct_ref;
-            n_structs++;
-          }
-        }
-        if (n_structs == 1) {
-          struct_ref = last_struct;
-        }
-      }
-      if (const TypeDataGenericTypeWithTs* hint_withTs = hint->unwrap_alias()->try_as<TypeDataGenericTypeWithTs>()) {
-        struct_ref = hint_withTs->struct_ref;
+      if (const TypeDataStruct* hint_struct = try_pick_T_from_hint<TypeDataStruct>(hint)) {
+        struct_ref = hint_struct->struct_ref;   // `var v: Point = {}` or `var v: Point | int = {}`
+      } else if (const TypeDataGenericTypeWithTs* hint_withTs = try_pick_T_from_hint<TypeDataGenericTypeWithTs>(hint)) {
+        struct_ref = hint_withTs->struct_ref;   // `var v: Wrapper<int> = {}` or within a union
       }
     }
-    if (!struct_ref) {
-      fire(cur_f, v->loc, "can not detect struct name\nuse either `var v: StructName = { ... }` or `var v = StructName { ... }`");
+    if (!struct_ref || struct_ref->is_instantiation_of_LispListT()) {
+      err("can not detect struct name\nuse either `var v: StructName = { ... }` or `var v = StructName { ... }`").fire(v, cur_f);
     }
 
     // so, we have struct_ref, so we can check field names and infer values
@@ -1418,12 +1532,12 @@ class InferTypesAndCallsAndFieldsVisitor final {
       std::string_view field_name = field_i->get_field_name();
       StructFieldPtr field_ref = struct_ref->find_field(field_name);
       if (!field_ref) {
-        fire(cur_f, field_i->loc, "field `" + to_string(field_name) + "` not found in struct " + to_string(struct_ref));
+        err("field `{}` not found in struct `{}`", field_name, struct_ref).fire(field_i->get_field_identifier(), cur_f);
       }
       field_i->mutate()->assign_field_ref(field_ref);
 
       if (occurred_mask & (1ULL << field_ref->field_idx)) {
-        fire(cur_f, field_i->loc, "duplicate field initialization");
+        err("duplicate field initialization").fire(field_i->get_field_identifier(), cur_f);
       }
       occurred_mask |= 1ULL << field_ref->field_idx;
 
@@ -1434,7 +1548,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
       }
       flow = infer_any_expr(val_i, std::move(flow), false, field_type).out_flow;
       if (field_type->has_genericT_inside()) {
-        deducingTs.auto_deduce_from_argument(cur_f, field_i->loc, field_type, val_i->inferred_type);
+        deducingTs.auto_deduce_from_argument(cur_f, field_i->get_init_val()->range, field_type, val_i->inferred_type);
       }
       assign_inferred_type(field_i, val_i);
     }
@@ -1447,7 +1561,7 @@ class InferTypesAndCallsAndFieldsVisitor final {
         nameT_unknown = deducingTs.get_first_not_deduced_nameT();
       }
       if (!nameT_unknown.empty()) {
-        deducingTs.fire_error_can_not_deduce(cur_f, v->loc, nameT_unknown);
+        deducingTs.err_can_not_deduce(nameT_unknown).fire(v, cur_f);
       }
       struct_ref = instantiate_generic_struct(struct_ref, deducingTs.flush());
       // re-assign field_ref (it was earlier assigned into a field of a generic struct)
@@ -1460,9 +1574,9 @@ class InferTypesAndCallsAndFieldsVisitor final {
     // check that all fields are present (do it after potential generic instantiation, when types are known)
     for (StructFieldPtr field_ref : struct_ref->fields) {
       if (!(occurred_mask & (1ULL << field_ref->field_idx))) {
-        bool allow_missing = field_ref->has_default_value() || field_ref->declared_type == TypeDataNever::create();
+        bool allow_missing = field_ref->has_default_value() || field_ref->declared_type == TypeDataVoid::create();
         if (!allow_missing) {
-          fire(cur_f, v->get_body()->loc, "field `" + field_ref->name + "` missed in initialization of struct " + to_string(struct_ref));
+          err("field `{}` missed in initialization of struct `{}`", field_ref, struct_ref).fire(SrcRange::empty_at_end(v->range), cur_f);
         }
       }
     }
@@ -1470,6 +1584,42 @@ class InferTypesAndCallsAndFieldsVisitor final {
     v->mutate()->assign_struct_ref(struct_ref);
     assign_inferred_type(v, TypeDataStruct::create(struct_ref));
     assign_inferred_type(v->get_body(), v);
+    return ExprFlow(std::move(flow), used_as_condition);
+  }
+
+  ExprFlow infer_lambda_fun(V<ast_lambda_fun> v, FlowContext&& flow, bool used_as_condition, TypePtr hint) {
+    // parameters of a lambda are allowed to be untyped: they are inferred before instantiation, e.g.
+    // > fun call(f: (int) -> slice) { ... }
+    // > call(fun(i) { ... })
+    // then from a hint, calculate params_types=[int], return_type=slice
+    const TypeDataFunCallable* h_callable = hint ? try_pick_T_from_hint<TypeDataFunCallable>(hint) : nullptr;
+
+    std::vector<TypePtr> params_types;
+    params_types.reserve(v->get_num_params());
+    for (int i = 0; i < v->get_num_params(); ++i) {
+      if (auto declared_type_node = v->get_param(i)->type_node) {
+        params_types.push_back(declared_type_node->resolved_type);
+      } else if (h_callable && i < h_callable->params_size() && !h_callable->params_types[i]->has_genericT_inside()) {
+        params_types.push_back(h_callable->params_types[i]);
+      } else {
+        err("can not infer type of parameter, specify it manually `{}: <type>`", v->get_param(i)->get_name()).fire(v->get_param(i), cur_f);
+      }
+    }
+
+    TypePtr return_type = nullptr;
+    if (v->return_type_node) {
+      return_type = v->return_type_node->resolved_type;
+    } else if (h_callable && !h_callable->return_type->has_genericT_inside()) {
+      return_type = h_callable->return_type;
+    }
+
+    // instantiating lambdas is very similar to generic functions, also done at type inferring;
+    tolk_assert(v->lambda_ref == nullptr);
+    FunctionPtr lambda_ref = instantiate_lambda_function(v, cur_f, params_types, return_type);
+
+    // lambda_ref already travelled the pipeline including type inferring
+    v->mutate()->assign_lambda_ref(lambda_ref);
+    assign_inferred_type(v, lambda_ref->inferred_full_type);
     return ExprFlow(std::move(flow), used_as_condition);
   }
 
@@ -1524,13 +1674,21 @@ class InferTypesAndCallsAndFieldsVisitor final {
   }
 
   FlowContext process_repeat_statement(V<ast_repeat_statement> v, FlowContext&& flow) {
-    ExprFlow after_cond = infer_any_expr(v->get_cond(), std::move(flow), false);
+    // loops are inferred twice, to merge body outcome with the state before the loop
+    // in `repeat` (as opposed to `while`), a condition is not boolean, it's a number
+    flow = infer_any_expr(v->get_cond(), std::move(flow), false).out_flow;
+    FlowContext loop_entry_facts = flow.clone();
+    FlowContext body_out = process_any_statement(v->get_body(), std::move(flow));
 
-    return process_any_statement(v->get_body(), std::move(after_cond.out_flow));
+    // second time, to refine all types
+    flow = FlowContext::merge_flow(std::move(loop_entry_facts), std::move(body_out));
+    FlowContext body_out2 = process_any_statement(v->get_body(), flow.clone());
+    // merge second body output to account for its effects on the loop state
+    return FlowContext::merge_flow(std::move(flow), std::move(body_out2));
   }
 
   FlowContext process_while_statement(V<ast_while_statement> v, FlowContext&& flow) {
-    // loops are inferred twice, to merge body outcome with the state before the loop
+    // loops are inferred twice; read comments above
     // (a more correct approach would be not "twice", but "find a fixed point when state stop changing")
     // also remember, we don't have a `break` statement, that's why when loop exits, condition became false
     FlowContext loop_entry_facts = flow.clone();
@@ -1538,12 +1696,15 @@ class InferTypesAndCallsAndFieldsVisitor final {
     FlowContext body_out = process_any_statement(v->get_body(), std::move(after_cond.true_flow));
     // second time, to refine all types
     flow = FlowContext::merge_flow(std::move(loop_entry_facts), std::move(body_out));
-    ExprFlow after_cond2 = infer_any_expr(v->get_cond(), std::move(flow), true);
-    v->get_cond()->mutate()->assign_always_true_or_false(after_cond2.get_always_true_false_state());
+    ExprFlow after_cond2 = infer_any_expr(v->get_cond(), flow.clone(), true);
+    FlowContext body_out2 = process_any_statement(v->get_body(), std::move(after_cond2.true_flow));
+    // unlike do_while (where cond is last and already sees body effects), in while cond precedes body,
+    // so merge the second body output back and re-evaluate the condition (third time!)
+    flow = FlowContext::merge_flow(std::move(flow), std::move(body_out2));
+    ExprFlow after_cond3 = infer_any_expr(v->get_cond(), std::move(flow), true);
+    v->get_cond()->mutate()->assign_always_true_or_false(after_cond3.get_always_true_false_state());
 
-    process_any_statement(v->get_body(), std::move(after_cond2.true_flow));
-
-    return std::move(after_cond2.false_flow);
+    return std::move(after_cond3.false_flow);
   }
 
   FlowContext process_do_while_statement(V<ast_do_while_statement> v, FlowContext&& flow) {
@@ -1634,13 +1795,13 @@ public:
 
       if (!body_end.is_unreachable()) {
         fun_ref->mutate()->assign_is_implicit_return();
-        if (fun_ref->declared_return_type == TypeDataNever::create()) {   // `never` can only be declared, it can't be inferred
-          fire(fun_ref, v_function->get_body()->as<ast_block_statement>()->loc_end, "a function returning `never` can not have a reachable endpoint");
+        if (fun_ref->declared_return_type == TypeDataNever::create()) {
+          err("a function returning `never` can not have a reachable endpoint").fire(SrcRange::empty_at_end(v_function->range), fun_ref);
         }
       }
 
       if (!fun_ref->declared_return_type) {
-        TypeInferringUnifyStrategy return_unifier;
+        TypeInferringUnifyStrategy return_unifier(nullptr);
         if (fun_ref->does_return_self()) {
           return_unifier.unify_with(fun_ref->parameters[0].declared_type);
         }
@@ -1654,22 +1815,22 @@ public:
         }
         inferred_return_type = return_unifier.get_result();
         if (inferred_return_type == nullptr) {    // if no return statements at all
-          inferred_return_type = TypeDataVoid::create();
+          inferred_return_type = body_end.is_unreachable() ? TypeDataNever::create() : TypeDataVoid::create();
         }
 
         if (!body_end.is_unreachable() && inferred_return_type != TypeDataVoid::create()) {
-          fire(fun_ref, v_function->get_body()->as<ast_block_statement>()->loc_end, "missing return");
+          err("missing return").fire(SrcRange::empty_at_end(v_function->range), fun_ref);
         }
         if (has_void_returns && has_non_void_returns) {
           for (AnyExprV return_expr : return_statements) {
             if (return_expr->inferred_type == TypeDataVoid::create()) {
-              fire(fun_ref, return_expr->loc, "mixing void and non-void returns in function " + to_string(fun_ref));
+              err("mixing void and non-void returns in function `{}`", fun_ref).fire(return_expr, fun_ref);
             }
           }
         }
-        if (return_unifier.is_union_of_different_types()) {
+        if (return_unifier.became_union_without_hint()) {
           // `return intVar` + `return sliceVar` results in `int | slice`, probably unexpected
-          fire(fun_ref, v_function->get_body()->loc, "function " + to_string(fun_ref) + " calculated return type is " + to_string(inferred_return_type) + "; probably, it's not what you expected\ndeclare `fun (...): <return_type>` manually");
+          err("function `{}` calculated return type is `{}`; probably, it's not what you expected\ndeclare `fun (...): <return_type>` manually", fun_ref, inferred_return_type).fire(v_function->get_identifier(), fun_ref);
         }
       }
 
@@ -1707,6 +1868,11 @@ public:
       }
     }
   }
+
+  // given `enum Color { Red = 1 }` infer that it's int
+  void start_visiting_enum_member(EnumMemberPtr member_ref) {
+    infer_any_expr(member_ref->init_value, FlowContext(), false);
+  }
 };
 
 class LaunchInferTypesAndMethodsOnce final {
@@ -1727,7 +1893,7 @@ public:
 // when analyzing `f()`, we need to infer what fun_ref=g returns
 // (if `g` is generic, it was already instantiated, so fun_ref=g<int> is here)
 static void infer_and_save_return_type_of_function(FunctionPtr fun_ref) {
-  static std::vector<FunctionPtr> called_stack;
+  static thread_local std::vector<FunctionPtr> called_stack;
 
   tolk_assert(!fun_ref->is_generic_function() && !fun_ref->is_type_inferring_done());
   // if `g` has return type declared, like `fun g(): int { ... }`, don't traverse its body
@@ -1739,7 +1905,7 @@ static void infer_and_save_return_type_of_function(FunctionPtr fun_ref) {
   // prevent recursion of untyped functions, like `fun f() { return g(); } fun g() { return f(); }`
   bool contains = std::find(called_stack.begin(), called_stack.end(), fun_ref) != called_stack.end();
   if (contains) {
-    fire(fun_ref, fun_ref->loc, "could not infer return type of " + to_string(fun_ref) + ", because it appears in a recursive call chain\ndeclare `fun (...): <return_type>` manually");
+    err("could not infer return type of `{}`, because it appears in a recursive call chain\ndeclare `fun (...): <return_type>` manually", fun_ref).fire(fun_ref->ident_anchor, fun_ref);
   }
 
   // dig into g's body; it's safe, since the compiler is single-threaded
@@ -1754,12 +1920,12 @@ static void infer_and_save_return_type_of_function(FunctionPtr fun_ref) {
 // example: `const a = 1 + b;`
 // when analyzing `a`, we need to infer what type const_ref=b has
 static void infer_and_save_type_of_constant(GlobalConstPtr const_ref) {
-  static std::vector<GlobalConstPtr> called_stack;
+  static thread_local std::vector<GlobalConstPtr> called_stack;
 
   // prevent recursion like `const a = b; const b = a`
   bool contains = std::find(called_stack.begin(), called_stack.end(), const_ref) != called_stack.end();
   if (contains) {
-    throw ParseError(const_ref->loc, "const `" + const_ref->name + "` appears, directly or indirectly, in its own initializer");
+    err("const `{}` appears, directly or indirectly, in its own initializer", const_ref).fire(const_ref->ident_anchor);
   }
 
   called_stack.push_back(const_ref);
@@ -1769,7 +1935,16 @@ static void infer_and_save_type_of_constant(GlobalConstPtr const_ref) {
 }
 
 void pipeline_infer_types_and_calls_and_fields() {
-  visit_ast_of_all_functions<LaunchInferTypesAndMethodsOnce>();
+  // loop over user-defined functions
+  LaunchInferTypesAndMethodsOnce launcher;
+  visit_ast_of_all_functions(launcher);
+
+  // assign inferred_type to built-in functions like __throw() 
+  for (FunctionPtr fun_ref : get_all_builtin_functions()) {
+    if (LaunchInferTypesAndMethodsOnce::should_visit_function(fun_ref)) {
+      infer_and_save_return_type_of_function(fun_ref);      
+    }    
+  }
 
   // analyze constants that weren't referenced by any function
   InferTypesAndCallsAndFieldsVisitor visitor;
@@ -1783,6 +1958,15 @@ void pipeline_infer_types_and_calls_and_fields() {
   for (StructPtr struct_ref : get_all_declared_structs()) {
     if (!struct_ref->is_generic_struct()) {
       visitor.start_visiting_struct_fields(struct_ref);
+    }
+  }
+
+  // infer types for init_value of enum members
+  for (EnumDefPtr enum_ref : get_all_declared_enums()) {
+    for (EnumMemberPtr member_ref : enum_ref->members) {
+      if (member_ref->has_init_value()) {
+        visitor.start_visiting_enum_member(member_ref);
+      }
     }
   }
 }

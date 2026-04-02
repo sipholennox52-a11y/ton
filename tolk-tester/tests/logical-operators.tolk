@@ -1,9 +1,11 @@
 import "imports/use-dicts.ext.tolk"
 
+@method_id(90)
 fun simpleAllConst() {
     return (!0, !!0 & !false, !!!0, !1, !!1, !-1, !!-1, (!5 as int == 0) == !0, !0 == true);
 }
 
+@method_id(91)
 fun compileTimeEval1(x: int) {
     // todo now compiler doesn't understand that bool can't be equal to number other than 0/-1
     // (but understands that it can't be positive)
@@ -53,7 +55,7 @@ fun testDict(last: int) {
 }
 
 @method_id(105)
-fun testNotNull(x: int?) {
+fun testNotNull(x: int?): tuple {
     return [x == null, null == x, !(x == null), null == null, (null != null) as int];
 }
 
@@ -172,6 +174,96 @@ fun test115() {
     return (tru, fals);
 }
 
+@method_id(116)
+fun testCodegenOptimizeThrowIF(b: bool, i: int) {
+    assert (!b) throw 100;
+    assert (!!b) throw 100;
+    assert (b == false) throw 100;
+    assert (b != false) throw 100;
+
+    assert (!i) throw 101;
+    assert (!!i) throw 101;
+    assert (i == 0) throw 101;
+    assert (i != 0) throw 101;
+}
+
+@method_id(117)
+fun test117(x: int) {
+    var t = createEmptyTuple();
+
+    try { assert (x == 0) throw 100; }
+    catch (ex) { t.push(ex); }
+    try { assert (x != 0) throw 101; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(x == 10)) throw 102; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(x != 100)) throw 103; }
+    catch (ex) { t.push(ex); }
+    try { assert (!!(x != 100)) throw 104; }
+    catch (ex) { t.push(ex); }
+    try { assert (x) throw 105; }
+    catch (ex) { t.push(ex); }
+    try { assert (!x) throw 106; }
+    catch (ex) { t.push(ex); }
+    try { assert (~x) throw 107; }
+    catch (ex) { t.push(ex); }
+    try { assert (~(x + 1)) throw 108; }
+    catch (ex) { t.push(ex); }
+
+    return t;
+}
+
+@method_id(118)
+fun test118(y: int?) {
+    var t = createEmptyTuple();
+
+    try { assert (y == null) throw 200; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(y == null)) throw 201; }
+    catch (ex) { t.push(ex); }
+    try { assert (y != null) throw 202; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(y != null)) throw 203; }
+    catch (ex) { t.push(ex); }
+
+    return t;
+}
+
+@method_id(119)
+fun test119(condition: bool) {
+    var x = 7;
+    return (x, condition ? x = 9 : x = 10, x);
+}
+
+@method_id(120)
+fun test120(condition: bool) {
+    var (x, y) = (7, 7);
+    return (
+        (x, 0 && (x = 100)).0,
+        (x, 1 && (x = 101)).0,
+        (x, 0 || (x = 102)).0,
+        (x, 1 || (x = 103)).0,
+        (y, condition && (y = 101)).0,
+        (y, condition || (y = 102)).0,
+        x,
+        y,
+    )
+}
+
+@method_id(121)
+fun test121() {
+    var x = 1;
+    val c1 = true;
+    val c2 = true;
+    return (x, c1 && (x = 2), x, c2 && (x = 3), x);
+}
+
+@method_id(122)
+fun test122(cond: bool) {
+    var x = 1;
+    return (x, cond && (x = 2), x, cond && (x = 3), x);
+}
+
 
 fun main() {
 
@@ -214,6 +306,19 @@ fun main() {
 @testcase | 113 | 0      | 1
 @testcase | 114 |        | 0
 @testcase | 115 |        | -1 0
+@testcase | 117 | -1     | [ 100 103 106 107 ]
+@testcase | 117 | -2     | [ 100 103 106 108 ]
+@testcase | 117 | 10     | [ 100 102 103 106 ]
+@testcase | 117 | 100    | [ 100 104 106 ]
+@testcase | 118 | null   | [ 201 202 ]
+@testcase | 118 | 5      | [ 200 203 ]
+@testcase | 119 | 0      | 7 10 10
+@testcase | 119 | -1     | 7 9 9
+@testcase | 120 | 0      | 7 7 101 102 7 7 102 102
+@testcase | 120 | -1     | 7 7 101 102 7 101 102 101
+@testcase | 121 |        | 1 -1 2 -1 3
+@testcase | 122 | -1     | 1 -1 2 -1 3
+@testcase | 122 | 0      | 1 0 1 0 1
 
 @fif_codegen
 """
@@ -277,14 +382,14 @@ fun main() {
     FALSE
     0 PUSHINT
     DUP
-    TRIPLE
+    3 TUPLE
     TRUE
     TRUE
     TRUE
-    TRIPLE
+    3 TUPLE
     FALSE
     TRUE
-    PAIR
+    2 TUPLE
   }>
 """
 
@@ -299,14 +404,14 @@ fun main() {
     FALSE
     FALSE
     FALSE
-    TRIPLE
+    3 TUPLE
     -1 PUSHINT
     DUP
     TRUE
-    TRIPLE
+    3 TUPLE
     -1 PUSHINT
     FALSE
-    PAIR
+    2 TUPLE
   }>
 """
 
@@ -351,15 +456,36 @@ These are moments of future optimizations. For now, it's more than enough.
     DUP	//  x x
     IFNOTJMP:<{	//  x
       DROP	//
-      1 PUSHINT	//  '7=1
+      1 PUSHINT	//  '5=1
     }>	//  x
     DUP	//  x x
     IFNOTJMP:<{	//  x
       DROP	//
-      1 PUSHINT	//  '8=1
+      1 PUSHINT	//  '6=1
     }>	//  x
     100 THROWIFNOT
-    -4 PUSHINT	//  '11=-4
+    -4 PUSHINT	//  '8=-4
+  }>
+"""
+
+@fif_codegen
+"""
+  testCodegenOptimizeThrowIF() PROC:<{
+    OVER
+    100 THROWIF
+    OVER
+    100 THROWIFNOT
+    OVER
+    100 THROWIF
+    SWAP
+    100 THROWIFNOT
+    DUP
+    101 THROWIF
+    DUP
+    101 THROWIFNOT
+    DUP
+    101 THROWIF
+    101 THROWIFNOT
   }>
 """
 

@@ -20,12 +20,11 @@
 
 #include <map>
 
+#include "auto/tl/ton_api.h"
+#include "dht/dht.h"
+#include "keys/encryptor.h"
 #include "td/actor/actor.h"
 #include "td/utils/BufferedUdp.h"
-#include "auto/tl/ton_api.h"
-#include "keys/encryptor.h"
-#include "adnl-peer-table.h"
-#include "dht/dht.h"
 
 #include "adnl-peer-table.h"
 #include "utils.hpp"
@@ -125,12 +124,15 @@ class AdnlLocalId : public td::actor::Actor {
     std::map<td::IPAddress, Counter> dropped_packets;
 
     tl_object_ptr<ton_api::adnl_stats_localIdPackets> tl(bool all = true) const;
-  } packet_stats_cur_, packet_stats_prev_, packet_stats_total_;
+  } packet_stats_cur_, packet_stats_prev_;
   void add_decrypted_packet_stats(td::IPAddress addr);
   void add_dropped_packet_stats(td::IPAddress addr);
   void prepare_packet_stats();
 
   void publish_address_list();
+
+  td::Timestamp publish_address_list_at_ = td::Timestamp::now();
+  td::Timestamp cleanup_rate_limiter_at_ = td::Timestamp::never();
 };
 
 inline td::StringBuilder &operator<<(td::StringBuilder &sb, const AdnlLocalId::PrintId &id) {

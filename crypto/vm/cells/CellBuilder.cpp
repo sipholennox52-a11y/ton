@@ -16,15 +16,12 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "openssl/digest.hpp"
+#include "td/utils/format.h"
+#include "td/utils/misc.h"
 #include "vm/cells/CellBuilder.h"
-
 #include "vm/cells/CellSlice.h"
 #include "vm/cells/DataCell.h"
-
-#include "td/utils/misc.h"
-#include "td/utils/format.h"
-
-#include "openssl/digest.hpp"
 
 namespace vm {
 
@@ -32,9 +29,9 @@ using td::Ref;
 using td::RefAny;
 
 /*
- * 
+ *
  *   CELL BUILDERS
- * 
+ *
  */
 
 CellBuilder::~CellBuilder() {
@@ -100,7 +97,7 @@ Ref<DataCell> CellBuilder::finalize(bool special) {
 }
 
 Ref<Cell> CellBuilder::create_pruned_branch(Ref<Cell> cell, td::uint32 new_level, td::uint32 virt_level) {
-  if (cell->is_loaded() && cell->get_level() <= virt_level && cell->get_virtualization() == 0) {
+  if (cell->is_loaded() && cell->get_level() <= virt_level && !cell->is_virtualized()) {
     CellSlice cs(NoVm{}, cell);
     if (cs.size_refs() == 0) {
       return cell;
@@ -313,7 +310,7 @@ bool CellBuilder::store_long_bool(long long val, unsigned val_bits) {
 }
 
 bool CellBuilder::store_long_rchk_bool(long long val, unsigned val_bits) {
-  if (val_bits > 64 || !can_extend_by(val_bits)) {
+  if (val_bits == 0 || val_bits > 64 || !can_extend_by(val_bits)) {
     return false;
   }
   if (val_bits < 64 && (val < static_cast<long long>(std::numeric_limits<td::uint64>::max() << (val_bits - 1)) ||

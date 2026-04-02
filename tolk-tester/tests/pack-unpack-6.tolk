@@ -26,9 +26,7 @@ fun test2() {
 
 @method_id(103)
 fun test3() {
-    var cc: Cell<CounterIncrement> = {
-        tvmCell: beginCell().storeSlice(stringHexToSlice("0109ab")).endCell()
-    };
+    var cc = beginCell().storeSlice(stringHexToSlice("0109ab")).endCell() as Cell<CounterIncrement>;
     return cc.load({assertEndAfterReading: false});
 }
 
@@ -134,8 +132,7 @@ RETALT
     x{0109ab} PUSHSLICE
     NEWC
     STSLICE
-    ENDC
-    CTOS
+    BTOS
     x{01} SDBEGINSQ
     63 THROWIFNOT
     8 PLDI
@@ -146,14 +143,14 @@ RETALT
 """
 IF:<{
   DROP
-  139 PUSHINT
+  129 PUSHINT
 }>ELSE<{
   x{03} SDBEGINSQ
   NIP
   IFNOTJMP:<{
     104 THROW
   }>
-  140 PUSHINT
+  130 PUSHINT
 }>
 """
 
@@ -176,8 +173,7 @@ IF:<{
     x{11} PUSHSLICE
     NEWC
     STSLICE
-    ENDC
-    HASHCU
+    HASHBU
 """
 
 @fif_codegen
@@ -189,8 +185,8 @@ IF:<{
     x{01} SDBEGINSQ             //  '2=65535 s '4
     s1 s2 XCHG                  //  s '2=65535 '4
     THROWANYIFNOT               //  s
-    8 LDI                       //  '9 s
-    ENDS                        //  '9
+    8 LDI                       //  '8 s
+    ENDS                        //  '8
   }>
 """
 
@@ -201,7 +197,7 @@ IF:<{
     x{01} SDBEGINSQ
     IF:<{
       DROP
-      139 PUSHINT
+      129 PUSHINT
     }>ELSE<{
       x{03} SDBEGINSQ
       NIP
@@ -209,9 +205,9 @@ IF:<{
         16 PUSHPOW2DEC
         THROWANY
       }>
-      140 PUSHINT
+      130 PUSHINT
     }>
-    139 PUSHINT
+    129 PUSHINT
     EQUAL
   }>
 """

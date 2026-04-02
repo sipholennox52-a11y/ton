@@ -16,21 +16,21 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "auto/tl/ton_api.h"
-#include "td/utils/Random.h"
-#include "common/delay.h"
+#include <limits>
 
 #include "adnl/utils.hpp"
-#include "dht/dht.h"
-
-#include "overlay.hpp"
+#include "auto/tl/ton_api.h"
 #include "auto/tl/ton_api.hpp"
-
+#include "common/delay.h"
+#include "dht/dht.h"
 #include "keys/encryptor.h"
+#include "rldp2/rldp.h"
+#include "td/utils/Random.h"
 #include "td/utils/Status.h"
 #include "td/utils/StringBuilder.h"
 #include "td/utils/port/signals.h"
-#include <limits>
+
+#include "overlay.hpp"
 
 namespace ton {
 
@@ -106,6 +106,20 @@ OverlayImpl::OverlayImpl(td::actor::ActorId<keyring::Keyring> keyring, td::actor
   auto nodes_size = static_cast<td::uint32>(nodes.size());
   OverlayImpl::update_root_member_list(std::move(nodes), std::move(root_public_keys), std::move(cert));
   update_neighbours(nodes_size);
+
+  if (overlay_type_ == OverlayType::Public &&
+      (!opts_.twostep_broadcast_sender_.empty() || opts_.send_twostep_broadcast_)) {
+    VLOG(OVERLAY_WARNING) << "Cannot enable twostep broadcasts in public overlay";
+    opts_.twostep_broadcast_sender_ = {};
+    opts_.send_twostep_broadcast_ = false;
+  }
+  if (opts_.send_twostep_broadcast_ && opts_.twostep_broadcast_sender_.empty()) {
+    VLOG(OVERLAY_WARNING) << "Twostep broadcast sender is not set";
+    opts_.send_twostep_broadcast_ = false;
+  }
+  if (!opts_.twostep_broadcast_sender_.empty()) {
+    broadcasts_twostep_.init_sender(opts_.twostep_broadcast_sender_);
+  }
 }
 
 void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getRandomPeers &query,
@@ -141,23 +155,7 @@ void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_ping
 
 void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getBroadcast &query,
                                 td::Promise<td::BufferSlice> promise) {
-  auto it = broadcasts_.find(query.hash_);
-  if (it == broadcasts_.end()) {
-    VLOG(OVERLAY_NOTICE) << this << ": received getBroadcastQuery(" << query.hash_ << ") from " << src
-                         << " but broadcast is unknown";
-    promise.set_value(create_serialize_tl_object<ton_api::overlay_broadcastNotFound>());
-    return;
-  }
-  if (delivered_broadcasts_.find(query.hash_) != delivered_broadcasts_.end()) {
-    VLOG(OVERLAY_DEBUG) << this << ": received getBroadcastQuery(" << query.hash_ << ") from " << src
-                        << " but broadcast already deleted";
-    promise.set_value(create_serialize_tl_object<ton_api::overlay_broadcastNotFound>());
-    return;
-  }
-
-  VLOG(OVERLAY_DEBUG) << this << ": received getBroadcastQuery(" << query.hash_ << ") from " << src
-                      << " sending broadcast";
-  promise.set_value(it->second->serialize());
+  broadcasts_simple_.process_query(src, query, std::move(promise));
 }
 
 void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getBroadcastList &query,
@@ -166,8 +164,8 @@ void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getB
   promise.set_error(td::Status::Error(ErrorCode::protoviolation, "dropping get broadcast list query"));
 }
 
-/*void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, adnl::AdnlQueryId query_id, ton_api::overlay_customQuery &query) {
-  callback_->receive_query(src, query_id, id_, std::move(query.data_));
+/*void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, adnl::AdnlQueryId query_id, ton_api::overlay_customQuery
+&query) { callback_->receive_query(src, query_id, id_, std::move(query.data_));
 }
 */
 
@@ -194,71 +192,81 @@ void OverlayImpl::receive_query(adnl::AdnlNodeIdShort src, tl_object_ptr<ton_api
   ton_api::downcast_call(*Q.get(), [&](auto &object) { this->process_query(src, object, std::move(promise)); });
 }
 
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_broadcast> bcast) {
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcast> bcast) {
   if (peer_list_.local_member_flags_ & OverlayMemberFlags::DoNotReceiveBroadcasts) {
-    return td::Status::OK();
+    co_return {};
   }
-  return BroadcastSimple::create(this, message_from, std::move(bcast));
+  if (!opts_.allow_old_broadcasts_) {
+    co_return td::Status::Error("overlay.broadcast not allowed");
+  }
+  co_await broadcasts_simple_.process_broadcast(this, message_from, std::move(bcast));
+  co_return {};
 }
 
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_broadcastFec> b) {
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcastFec> b) {
   if (peer_list_.local_member_flags_ & OverlayMemberFlags::DoNotReceiveBroadcasts) {
-    return td::Status::OK();
+    co_return {};
   }
-  return OverlayFecBroadcastPart::create(this, message_from, std::move(b));
+  if (!opts_.allow_old_broadcasts_) {
+    co_return td::Status::Error("overlay.broadcastFec not allowed");
+  }
+  co_await broadcasts_fec_.process_broadcast(this, message_from, std::move(b));
+  co_return {};
 }
 
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_broadcastFecShort> b) {
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcastFecShort> b) {
   if (peer_list_.local_member_flags_ & OverlayMemberFlags::DoNotReceiveBroadcasts) {
-    return td::Status::OK();
+    co_return {};
   }
-  return OverlayFecBroadcastPart::create(this, message_from, std::move(b));
-}
-
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_broadcastNotFound> bcast) {
-  return td::Status::Error(ErrorCode::protoviolation,
-                           PSTRING() << "received strange message broadcastNotFound from " << message_from);
-}
-
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_fec_received> msg) {
-  return td::Status::OK();  // disable this logic for now
-  auto it = fec_broadcasts_.find(msg->hash_);
-  if (it != fec_broadcasts_.end()) {
-    VLOG(OVERLAY_DEBUG) << this << ": received fec opt-out message from " << message_from << " for broadcast "
-                        << msg->hash_;
-    it->second->add_received(message_from);
-  } else {
-    VLOG(OVERLAY_DEBUG) << this << ": received fec opt-out message from " << message_from << " for unknown broadcast "
-                        << msg->hash_;
+  if (!opts_.allow_old_broadcasts_) {
+    co_return td::Status::Error("overlay.broadcastFecShort not allowed");
   }
-  return td::Status::OK();
+  co_await broadcasts_fec_.process_broadcast(this, message_from, std::move(b));
+  co_return {};
 }
 
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_fec_completed> msg) {
-  return td::Status::OK();  // disable this logic for now
-  auto it = fec_broadcasts_.find(msg->hash_);
-  if (it != fec_broadcasts_.end()) {
-    VLOG(OVERLAY_DEBUG) << this << ": received fec completed message from " << message_from << " for broadcast "
-                        << msg->hash_;
-    it->second->add_completed(message_from);
-  } else {
-    VLOG(OVERLAY_DEBUG) << this << ": received fec completed message from " << message_from << " for unknown broadcast "
-                        << msg->hash_;
-  }
-  return td::Status::OK();
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcastNotFound> bcast) {
+  co_return td::Status::Error(ErrorCode::protoviolation,
+                              PSTRING() << "received strange message broadcastNotFound from " << message_from);
 }
 
-td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                          tl_object_ptr<ton_api::overlay_unicast> msg) {
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_fec_received> msg) {
+  co_return {};
+}
+
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_fec_completed> msg) {
+  co_return {};
+}
+
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_unicast> msg) {
   VLOG(OVERLAY_DEBUG) << this << ": received unicast from " << message_from;
   callback_->receive_message(message_from, overlay_id_, std::move(msg->data_));
-  return td::Status::OK();
+  co_return {};
+}
+
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcastTwostepSimple> bcast) {
+  if (opts_.twostep_broadcast_sender_.empty()) {
+    co_return td::Status::Error("twostep broadcasts are not enabled");
+  }
+  co_await broadcasts_twostep_.process_broadcast(this, message_from, std::move(bcast));
+  co_return {};
+}
+
+td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                                 tl_object_ptr<ton_api::overlay_broadcastTwostepFec> bcast) {
+  if (opts_.twostep_broadcast_sender_.empty()) {
+    co_return td::Status::Error("twostep broadcasts are not enabled");
+  }
+  co_await broadcasts_twostep_.process_broadcast(this, message_from, std::move(bcast));
+  co_return {};
 }
 
 void OverlayImpl::receive_message(adnl::AdnlNodeIdShort src, tl_object_ptr<ton_api::overlay_messageExtra> extra,
@@ -275,8 +283,15 @@ void OverlayImpl::receive_message(adnl::AdnlNodeIdShort src, tl_object_ptr<ton_a
     return;
   }
   auto Q = X.move_as_ok();
-  ton_api::downcast_call(*Q.get(), [Self = this, &Q, &src](auto &object) {
-    Self->process_broadcast(src, move_tl_object_as<std::remove_reference_t<decltype(object)>>(Q));
+  ton_api::downcast_call(*Q, [self = this, &Q, &src](auto &object) {
+    [](OverlayImpl *self, adnl::AdnlNodeIdShort src, auto obj) -> td::actor::Task<> {
+      auto status = (co_await self->process_broadcast(src, std::move(obj)).wrap()).move_as_status();
+      LOG_IF(WARNING, status.is_error() && status.code() != ErrorCode::notready)
+          << "Failed to process broadcast: " << status;
+      co_return {};
+    }(self, src, move_tl_object_as<std::remove_reference_t<decltype(object)>>(Q))
+                                                                      .start()
+                                                                      .detach();
   });
 }
 
@@ -377,6 +392,34 @@ void OverlayImpl::alarm() {
   }
 }
 
+void OverlayImpl::start_up() {
+  update_throughput_at_ = td::Timestamp::in(50.0);
+  last_throughput_update_ = td::Timestamp::now();
+
+  if (overlay_type_ == OverlayType::Public) {
+    update_db_at_ = td::Timestamp::in(60.0);
+  }
+  alarm_timestamp() = td::Timestamp::in(1);
+
+  if (!opts_.twostep_broadcast_sender_.empty()) {
+    td::actor::send_closure(opts_.twostep_broadcast_sender_, &adnl::AdnlSenderEx::add_id, local_id_);
+    update_peers_mtu();
+  }
+}
+
+void OverlayImpl::update_peers_mtu() {
+  if (!opts_.twostep_broadcast_sender_.empty()) {
+    td::uint64 mtu = rules_.max_broadcast_size() + 1024;
+    std::vector<adnl::AdnlNodeIdShort> peers;
+    iterate_all_peers([&](const adnl::AdnlNodeIdShort &peer_id, const OverlayPeer &peer) {
+      if (peer.is_permanent_member() && peer_id != local_id_) {
+        peers.push_back(peer_id);
+      }
+    });
+    peers_mtu_guard_ = adnl::PeersMtuGuard{opts_.twostep_broadcast_sender_, local_id_, std::move(peers), mtu};
+  }
+}
+
 void OverlayImpl::receive_dht_nodes(dht::DhtValue v) {
   CHECK(overlay_type_ == OverlayType::Public);
   auto R = fetch_tl_object<ton_api::overlay_nodes>(v.value().clone(), true);
@@ -451,28 +494,9 @@ void OverlayImpl::update_dht_nodes(OverlayNode node) {
 }
 
 void OverlayImpl::bcast_gc() {
-  while (broadcasts_.size() > max_data_bcasts()) {
-    auto bcast = BroadcastSimple::from_list_node(bcast_data_lru_.get());
-    CHECK(bcast);
-    auto hash = bcast->get_hash();
-    broadcasts_.erase(hash);
-    if (delivered_broadcasts_.insert(hash).second) {
-      bcast_lru_.push(hash);
-    }
-  }
-  while (fec_broadcasts_.size() > 0) {
-    auto bcast = BroadcastFec::from_list_node(bcast_fec_lru_.prev);
-    CHECK(bcast);
-    if (bcast->get_date() > td::Clocks::system() - 60) {
-      break;
-    }
-    auto hash = bcast->get_hash();
-    CHECK(fec_broadcasts_.count(hash) == 1);
-    fec_broadcasts_.erase(hash);
-    if (delivered_broadcasts_.insert(hash).second) {
-      bcast_lru_.push(hash);
-    }
-  }
+  broadcasts_simple_.gc(this);
+  broadcasts_fec_.gc(this);
+  broadcasts_twostep_.gc(this);
   while (bcast_lru_.size() > max_bcasts()) {
     auto Id = bcast_lru_.front();
     bcast_lru_.pop();
@@ -491,13 +515,12 @@ void OverlayImpl::send_broadcast(PublicKeyHash send_as, td::uint32 flags, td::Bu
     VLOG(OVERLAY_WARNING) << "broadcast source certificate is invalid";
     return;
   }
-  auto S = BroadcastSimple::create_new(actor_id(this), keyring_, send_as, std::move(data), flags);
-  if (S.is_error()) {
-    LOG(WARNING) << "failed to send broadcast: " << S;
-  }
+  flags &= ~Overlays::BroadcastFlagNoTwostep();
+  broadcasts_simple_.send(this, send_as, std::move(data), flags);
 }
 
-void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data) {
+void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
+                                     td::BufferSlice extra) {
   if (!has_valid_membership_certificate()) {
     VLOG(OVERLAY_WARNING) << "member certificate is invalid, valid_until="
                           << peer_list_.local_cert_is_valid_until_.at_unix();
@@ -507,8 +530,16 @@ void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td
     VLOG(OVERLAY_WARNING) << "broadcast source certificate is invalid";
     return;
   }
-  OverlayOutboundFecBroadcast::create(std::move(data), flags, actor_id(this), send_as,
-                                      opts_.broadcast_speed_multiplier_);
+  bool no_twostep = flags & Overlays::BroadcastFlagNoTwostep();
+  flags &= ~Overlays::BroadcastFlagNoTwostep();
+  if (opts_.send_twostep_broadcast_ && !no_twostep) {
+    broadcasts_twostep_.send(this, send_as, std::move(data), std::move(extra), flags);
+  } else {
+    if (!extra.empty()) {
+      LOG(WARNING) << "Broadcast extra for old fec broadcast is not supported";
+    }
+    broadcasts_fec_.send(this, send_as, std::move(data), flags, opts_.broadcast_speed_multiplier_);
+  }
 }
 
 void OverlayImpl::print(td::StringBuilder &sb) {
@@ -526,13 +557,13 @@ td::Status OverlayImpl::check_date(td::uint32 date) {
   return td::Status::OK();
 }
 
-BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash& source, const Certificate* cert,
+BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash &source, const Certificate *cert,
                                                         td::uint32 size, bool is_fec) {
   if (size == 0) {
     return BroadcastCheckResult::Forbidden;
   }
   auto r = rules_.check_rules(source, size, is_fec);
-  if (!cert || r == BroadcastCheckResult::Allowed) {
+  if (!cert || r == BroadcastCheckResult::Allowed || overlay_type_ == OverlayType::FixedMemberList) {
     return r;
   }
   td::Bits256 cert_hash = get_tl_object_sha_bits256(cert->tl());
@@ -543,15 +574,15 @@ BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash& sou
                         /* skip_check_signature = */ cached);
   if (r2 != BroadcastCheckResult::Forbidden) {
     if (cached_cert == checked_certificates_cache_.end()) {
-      cached_cert = checked_certificates_cache_.emplace(
-          source, std::make_unique<CachedCertificate>(source, cert_hash)).first;
+      cached_cert =
+          checked_certificates_cache_.emplace(source, std::make_unique<CachedCertificate>(source, cert_hash)).first;
     } else {
       cached_cert->second->cert_hash = cert_hash;
       cached_cert->second->remove();
     }
     checked_certificates_cache_lru_.put(cached_cert->second.get());
     while (checked_certificates_cache_.size() > max_checked_certificates_cache_size_) {
-      auto to_remove = (CachedCertificate*)checked_certificates_cache_lru_.get();
+      auto to_remove = (CachedCertificate *)checked_certificates_cache_lru_.get();
       CHECK(to_remove);
       to_remove->remove();
       checked_certificates_cache_.erase(to_remove->source);
@@ -561,33 +592,9 @@ BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash& sou
   return broadcast_check_result_max(r, r2);
 }
 
-BroadcastCheckResult OverlayImpl::check_source_eligible(PublicKey source, const Certificate* cert, td::uint32 size,
+BroadcastCheckResult OverlayImpl::check_source_eligible(PublicKey source, const Certificate *cert, td::uint32 size,
                                                         bool is_fec) {
   return check_source_eligible(source.compute_short_id(), cert, size, is_fec);
-}
-
-td::Status OverlayImpl::check_delivered(BroadcastHash hash) {
-  if (delivered_broadcasts_.count(hash) == 1 || broadcasts_.count(hash) == 1) {
-    return td::Status::Error(ErrorCode::notready, "duplicate broadcast");
-  } else {
-    return td::Status::OK();
-  }
-}
-
-BroadcastFec *OverlayImpl::get_fec_broadcast(BroadcastHash hash) {
-  auto it = fec_broadcasts_.find(hash);
-  if (it == fec_broadcasts_.end()) {
-    return nullptr;
-  } else {
-    return it->second.get();
-  }
-}
-
-void OverlayImpl::register_fec_broadcast(std::unique_ptr<BroadcastFec> bcast) {
-  auto hash = bcast->get_hash();
-  bcast_fec_lru_.put(bcast.get());
-  fec_broadcasts_.emplace(hash, std::move(bcast));
-  bcast_gc();
 }
 
 void OverlayImpl::get_self_node(td::Promise<OverlayNode> promise) {
@@ -616,55 +623,27 @@ void OverlayImpl::get_self_node(td::Promise<OverlayNode> promise) {
 void OverlayImpl::send_new_fec_broadcast_part(PublicKeyHash local_id, Overlay::BroadcastDataHash data_hash,
                                               td::uint32 size, td::uint32 flags, td::BufferSlice part, td::uint32 seqno,
                                               fec::FecType fec_type, td::uint32 date) {
-  auto S = OverlayFecBroadcastPart::create_new(this, actor_id(this), local_id, data_hash, size, flags, std::move(part),
-                                               seqno, std::move(fec_type), date);
-  if (S.is_error() && S.code() != ErrorCode::notready) {
-    LOG(WARNING) << "failed to send broadcast part: " << S;
+  broadcasts_fec_.send_part(this, local_id, data_hash, size, flags, std::move(part), seqno, std::move(fec_type), date);
+}
+
+void OverlayImpl::broadcast_twostep_signed_simple(BroadcastTwostepDataSimple &&data,
+                                                  td::Result<std::pair<td::BufferSlice, PublicKey>> &&R) {
+  broadcasts_twostep_.signed_simple(this, std::move(data), std::move(R));
+}
+
+void OverlayImpl::broadcast_twostep_signed_fec(BroadcastTwostepDataFec &&data,
+                                               td::Result<std::pair<td::BufferSlice, PublicKey>> &&R) {
+  broadcasts_twostep_.signed_fec(this, std::move(data), std::move(R));
+}
+
+void OverlayImpl::deliver_broadcast(PublicKeyHash source, td::BufferSlice data, td::BufferSlice extra) {
+  callback_->receive_broadcast_with_extra(source, overlay_id_, std::move(data), std::move(extra));
+}
+
+void OverlayImpl::register_delivered_broadcast(const BroadcastHash &hash) {
+  if (delivered_broadcasts_.insert(hash).second) {
+    bcast_lru_.push(hash);
   }
-}
-
-void OverlayImpl::deliver_broadcast(PublicKeyHash source, td::BufferSlice data) {
-  callback_->receive_broadcast(source, overlay_id_, std::move(data));
-}
-
-void OverlayImpl::failed_to_create_fec_broadcast(td::Status reason) {
-  if (reason.code() == ErrorCode::notready) {
-    LOG(DEBUG) << "failed to receive fec broadcast: " << reason;
-  } else {
-    LOG(WARNING) << "failed to receive fec broadcast: " << reason;
-  }
-}
-
-void OverlayImpl::created_fec_broadcast(PublicKeyHash local_id, std::unique_ptr<OverlayFecBroadcastPart> bcast) {
-  bcast->update_overlay(this);
-  auto S = bcast->run();
-  if (S.is_error() && S.code() != ErrorCode::notready) {
-    LOG(WARNING) << "failed to send fec broadcast: " << S;
-  }
-}
-
-void OverlayImpl::failed_to_create_simple_broadcast(td::Status reason) {
-  if (reason.code() == ErrorCode::notready) {
-    LOG(DEBUG) << "failed to send simple broadcast: " << reason;
-  } else {
-    LOG(WARNING) << "failed to send simple broadcast: " << reason;
-  }
-}
-
-void OverlayImpl::created_simple_broadcast(std::unique_ptr<BroadcastSimple> bcast) {
-  bcast->update_overlay(this);
-  auto S = bcast->run();
-  register_simple_broadcast(std::move(bcast));
-  if (S.is_error() && S.code() != ErrorCode::notready) {
-    LOG(WARNING) << "failed to receive fec broadcast: " << S;
-  }
-}
-
-void OverlayImpl::register_simple_broadcast(std::unique_ptr<BroadcastSimple> bcast) {
-  auto hash = bcast->get_hash();
-  bcast_data_lru_.put(bcast.get());
-  broadcasts_.emplace(hash, std::move(bcast));
-  bcast_gc();
 }
 
 td::Result<Encryptor *> OverlayImpl::get_encryptor(PublicKey source) {
@@ -693,25 +672,45 @@ std::shared_ptr<Certificate> OverlayImpl::get_certificate(PublicKeyHash source) 
 
 void OverlayImpl::set_privacy_rules(OverlayPrivacyRules rules) {
   rules_ = std::move(rules);
+  update_peers_mtu();
+}
+
+bool OverlayImpl::is_delivered(const BroadcastHash &hash) {
+  return delivered_broadcasts_.find(hash) != delivered_broadcasts_.end();
 }
 
 void OverlayImpl::check_broadcast(PublicKeyHash src, td::BufferSlice data, td::Promise<td::Unit> promise) {
   callback_->check_broadcast(src, overlay_id_, std::move(data), std::move(promise));
 }
 
-void OverlayImpl::broadcast_checked(Overlay::BroadcastHash hash, td::Result<td::Unit> R) {
-  {
-    auto it = broadcasts_.find(hash);
-    if (it != broadcasts_.end()) {
-      it->second->broadcast_checked(std::move(R));
-    }
-  }
-  {
-    auto it = fec_broadcasts_.find(hash);
-    if (it != fec_broadcasts_.end()) {
-      it->second->broadcast_checked(std::move(R));
-    }
-  }
+void OverlayImpl::precheck_broadcast(PublicKeyHash src, td::Bits256 broadcast_id, td::BufferSlice extra,
+                                     td::Promise<td::Unit> promise) {
+  callback_->precheck_broadcast(src, overlay_id_, broadcast_id, std::move(extra), std::move(promise));
+}
+
+td::actor::Task<> OverlayImpl::precheck_broadcast(PublicKeyHash src, td::Bits256 broadcast_id, td::BufferSlice extra) {
+  auto [task, promise] = td::actor::StartedTask<>::make_bridge();
+  callback_->precheck_broadcast(src, overlay_id_, broadcast_id, std::move(extra), std::move(promise));
+  co_await std::move(task);
+  co_return {};
+}
+
+void OverlayImpl::broadcast_simple_signed(std::unique_ptr<BroadcastSimple> &&bcast,
+                                          td::Result<std::pair<td::BufferSlice, PublicKey>> &&R) {
+  broadcasts_simple_.signed_(this, std::move(bcast), std::move(R));
+}
+
+void OverlayImpl::broadcast_simple_checked(Overlay::BroadcastHash &&hash, td::Result<td::Unit> &&R) {
+  broadcasts_simple_.checked(this, std::move(hash), std::move(R));
+}
+
+void OverlayImpl::broadcast_fec_signed(std::unique_ptr<BroadcastFecPart> &&part,
+                                       td::Result<std::pair<td::BufferSlice, PublicKey>> &&R) {
+  broadcasts_fec_.signed_(this, std::move(part), std::move(R));
+}
+
+void OverlayImpl::broadcast_fec_checked(Overlay::BroadcastHash &&hash, td::Result<td::Unit> &&R) {
+  broadcasts_fec_.checked(this, std::move(hash), std::move(R));
 }
 
 void OverlayImpl::get_stats(td::Promise<tl_object_ptr<ton_api::engine_validator_overlayStats>> promise) {
@@ -776,8 +775,8 @@ void TrafficStats::add_packet(td::uint64 size, bool in) {
 }
 
 void TrafficStats::normalize(double elapsed) {
-  out_bytes = static_cast<td::uint64>(out_bytes / elapsed);
-  in_bytes = static_cast<td::uint64>(in_bytes / elapsed);
+  out_bytes = static_cast<td::uint64>(static_cast<double>(out_bytes) / elapsed);
+  in_bytes = static_cast<td::uint64>(static_cast<double>(in_bytes) / elapsed);
   out_packets = static_cast<td::uint32>(out_packets / elapsed);
   in_packets = static_cast<td::uint32>(in_packets / elapsed);
 }

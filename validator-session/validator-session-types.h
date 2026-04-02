@@ -18,18 +18,19 @@
 */
 #pragma once
 
-#include "td/utils/int_types.h"
-#include "crypto/common/bitstring.h"
-#include "adnl/adnl-node-id.hpp"
-#include "ton/ton-types.h"
-
 #include <ton/ton-tl.hpp>
+
+#include "adnl/adnl-node-id.hpp"
+#include "crypto/common/bitstring.h"
+#include "td/utils/int_types.h"
+#include "ton/ton-types.h"
 
 namespace ton {
 
 namespace validatorsession {
 
 constexpr int VERBOSITY_NAME(VALIDATOR_SESSION_WARNING) = verbosity_WARNING;
+constexpr int VERBOSITY_NAME(VALIDATOR_SESSION_BENCHMARK) = verbosity_WARNING;
 constexpr int VERBOSITY_NAME(VALIDATOR_SESSION_NOTICE) = verbosity_DEBUG;
 constexpr int VERBOSITY_NAME(VALIDATOR_SESSION_INFO) = verbosity_DEBUG;
 constexpr int VERBOSITY_NAME(VALIDATOR_SESSION_DEBUG) = verbosity_DEBUG;
@@ -59,6 +60,7 @@ struct ValidatorSessionOptions {
   td::uint32 max_collated_data_size = 4 << 20;
 
   bool new_catchain_ids = false;
+  bool use_quic = false;
 
   td::uint32 proto_version = 0;
 
@@ -230,7 +232,7 @@ struct NewValidatorGroupStats {
   std::vector<BlockIdExt> prev;
   td::uint32 self_idx = 0;
   PublicKeyHash self = PublicKeyHash::zero();
-  std::vector<Node> nodes;
+  std::vector<Node> nodes{};
 
   tl_object_ptr<ton_api::validatorStats_newValidatorGroup> tl() const {
     std::vector<tl_object_ptr<ton_api::tonNode_blockIdExt>> prev_arr;
@@ -257,7 +259,7 @@ struct EndValidatorGroupStats {
   ValidatorSessionId session_id = ValidatorSessionId::zero();
   double timestamp = -1.0;
   PublicKeyHash self = PublicKeyHash::zero();
-  std::vector<Node> nodes;
+  std::vector<Node> nodes{};
 
   tl_object_ptr<ton_api::validatorStats_endValidatorGroup> tl() const {
     std::vector<tl_object_ptr<ton_api::validatorStats_endValidatorGroup_node>> nodes_arr;

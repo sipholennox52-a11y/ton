@@ -137,7 +137,7 @@ struct NotFixedWidthStorage {
     f4: bool;
     f5: cell;
     f6: int8 | bool;
-    f7: address;
+    f7: any_address;
     f8: int8;
     f9: bits200;
     f10: (bits400, ());
@@ -222,6 +222,12 @@ struct WithVariadicInts {
     i2: varuint32;
 }
 
+struct WithInternalAddress {
+    f1: int8;
+    f2: address;
+    f3: int8;
+}
+
 global gModByCustom: int;
 
 type MagicGlobalModifier = ();
@@ -253,6 +259,43 @@ fun WithU111.getSlice_a16_b8(): slice asm "b{010000000000000001100000000011} PUS
 fun WithU111.getSlice_a8_b5(): slice asm "b{0000000001110111111} PUSHSLICE"
 fun WithU111.getSlice_a8_b5_nobit(): slice asm "b{000000000111011111} PUSHSLICE"
 
+struct Inner123 {
+    x: int8
+    y: int8
+}
+
+struct Outer123 {
+    opt: Inner123?
+}
+
+struct Outer124 {
+    opt: Inner123 | int8
+}
+
+struct WithTensorOfInt8 {
+    t: (int8, int8, int8)
+    after: int32 = 32
+}
+
+struct WithShape {
+    sh0: [int8, (int8, int8)]
+    sh1: [int8, Point]
+    after: int32 = 32
+}
+
+struct WithTensorAndUnionInside {
+    before: int8 = 8
+    tens: (int8, int16 | address)
+    sh: [Point?] = [null]
+}
+
+struct OuterWithInner {
+    iWithout: Point                 // can be safely skipped as (bits16)
+    iWith: CounterIncrement         // can not be safely skipped because of opcode
+    y: uint8
+    after: uint8
+}
+
 
 @noinline
 fun contract.getFakeData(seqno: int): Cell<WalletStorage> {
@@ -276,6 +319,10 @@ fun loadWalletStorage() {
 
 fun WalletStorage.load() {
     return WalletStorage.fromCell(contract.getFakeData(777));
+}
+
+fun inc8(mutate x: int8) {
+    x += 1;
 }
 
 @method_id(101)
@@ -319,9 +366,11 @@ fun demo104() {
 
 @method_id(105)
 fun demo105(s: slice) {
-    var c = lazy ComplexWithMaybePoint.fromSlice(s);
-    __expect_lazy("[c] load f1, skip (Point78ForMaybe?), load f3");
-    return (c.f1, c.f3);
+    return (fun(s: slice) {
+        var c = lazy ComplexWithMaybePoint.fromSlice(s);
+        __expect_lazy("[c] load f1, skip (Point78ForMaybe?), load f3");
+        return (c.f1, c.f3);
+    })(s);
 }
 
 @method_id(106)
@@ -671,7 +720,7 @@ fun demo133() {
         __expect_lazy("[st] skip (bits321), load extensions");
         while (!false) {
             assert(st.extensions != null, 123);
-            return st.extensions.iDictGet(32, 8).0!.loadUint(8);
+            return st.extensions.iDictGet(32, 8).0!.preloadUint(8);
         }
     } else {
         throw 0;
@@ -934,7 +983,7 @@ fun demo153() {
 global gTup: tuple;
 
 @noinline
-fun pushToGlobalTup<T>(v: T) { gTup.push(v.__toTuple()); }
+fun pushToGlobalTup<T>(v: T) { gTup.push(v.toTuple()); }
 
 @method_id(154)
 fun demo154() {
@@ -1006,6 +1055,18 @@ fun demo159() {
     val p4_b = p4.b;
 
     return (p1_bit, p2_bit, (p3.b is WithN5) ? p3.b.n as int : 777, p3_bit, (p4_b is WithN5) ? p4_b.n as int: 777);
+}
+
+@method_id(160)
+fun demo160() {
+    try {
+        // wrong opcode for CounterIncrement
+        var o = lazy OuterWithInner.fromSlice(stringHexToSlice("0000991122FF"), {throwIfOpcodeDoesNotMatch: 777});
+        __expect_lazy("[o] skip (bits16) (CounterIncrement), load y");     // not skip (bits24)
+        return o.y as int;
+    } catch (excno) {
+        return excno;
+    }
 }
 
 
@@ -1235,6 +1296,19 @@ fun demo218() {
     return (f2, pointY, o.toCell().hash() & 0xFFFF, o.f2);
 }
 
+@method_id(219)
+fun demo219() {
+    var m = lazy CounterReset.fromSlice(stringHexToSlice("04FFFF0000"));
+    match (m) {
+        CounterReset => {
+            m.initialValue = 0xFFFF;
+
+            var s = m.toCell().beginParse();
+            return (s.loadUint(40) == 0x040000FFFF, s.isEmpty());
+        }
+    }
+}
+
 
 @method_id(300)
 fun demo300() {
@@ -1346,14 +1420,14 @@ fun demo310() {
         f6: 10,
         f7: createAddressNone(),
         f8: 9,
-        f9: "" as bits200,
-        f10: ("" as bits400, ()),
+        f9: createEmptySlice() as bits200,
+        f10: ("".literalSlice() as bits400, ()),
         f11: 0,
     }.toCell({skipBitsNValidation: true});
     var st = lazy cell.load();
     var sm = lazy cell.load();
     var sk = lazy cell.load();
-    __expect_lazy("[st] load (bits8) (int8?) (bits9) (cell) f6, save immutable (tail), skip (address), load f8");
+    __expect_lazy("[st] load (bits8) (int8?) (bits9) (cell) f6, save immutable (tail), skip (any_address), load f8");
     match (st.f6) { int8 => st.f6 += 90, bool => throw 123 };
     __expect_lazy("[sm] load f5");
     sm.f5;  // previous (data-only) fields are not needed to reach a ref
@@ -1371,10 +1445,88 @@ fun demo311() {
     return st.toCell();
 }
 
+@method_id(312)
+fun demo312() {
+    val addr = address("EQDKbjIcfM6ezt8KjKJJLshZJJSqX7XOA4ff-W72r5gqPrHF");
+    val correct = beginCell().storeInt(0, 8).storeAddress(addr).storeInt(-1, 8).endCell();
+    var st = lazy WithInternalAddress.fromCell(correct);
+    __expect_lazy("[st] skip (bits8) (address), load f3");
+    val f3 = st.f3;
+    
+    val wrong = beginCell().storeInt(0, 8).storeAddressNone().storeAddress(addr).storeInt(-1, 8).endCell();
+    var st2 = lazy WithInternalAddress.fromCell(wrong);
+    // check that `address` (st2.f2) is validated even though unused
+    try {
+        return (f3, 0, st2.f3);
+    } catch (ex) {
+        return (f3, ex, 0 as int8);
+    }
+}
+
+@method_id(313)
+fun demo313() {
+    val c = WithTensorOfInt8{ t: (11, 12, 13) }.toCell();
+
+    var lazyS = lazy WithTensorOfInt8.fromCell(c);
+    __expect_lazy("[lazyS] load t, save immutable (tail)");
+    inc8(mutate lazyS.t.1);
+
+    return lazyS.toCell().load();
+}
+
+@method_id(314)
+fun demo314() {
+    val c = WithShape{
+        sh0: [8, (8, 8)],
+        sh1: [8, { x: 10, y: 20 }]
+    }.toCell();
+
+    var lazyS1 = lazy WithShape.fromCell(c);
+    __expect_lazy("[lazyS1] load (bits24) sh1, save immutable (tail)");
+    var cp = lazyS1.sh1.1.incXAndMakeCell();
+
+    var lazyS2 = lazy WithShape.fromCell(c);
+    __expect_lazy("[lazyS2] load sh0, save immutable (tail)");
+    inc8(mutate lazyS2.sh0.1.1);
+
+    return (cp.load(), lazyS1.toCell().load(), lazyS2.toCell().load().sh0);
+}
+
+@method_id(315)
+fun demo315() {
+    val c = WithTensorAndUnionInside{
+        tens: (8, 16)
+    }.toCell();
+
+    var lazyS = lazy WithTensorAndUnionInside.fromCell(c);
+    __expect_lazy("[lazyS] load (bits8) tens, save immutable (tail)");
+    match (lazyS.tens.1) {
+        int16 => { lazyS.tens.1 += 50 }
+        address => throw 123
+    }
+
+    return (lazyS.toCell().load());
+}
+
+@method_id(316)
+fun demo316() {
+    var p1 = lazy Point3d{ x: 2, y: 3, z: 99 }.toCell().load();
+    var p2 = lazy Point3d{ x: 2, y: 3, z: 99 }.toCell().load();
+    var p3 = lazy Point3d{ x: 2, y: 3, z: 99 }.toCell().load();
+    __expect_lazy("[p1] load x y z");
+    val cp1 = (p1 = p1).toCell().load();
+    __expect_lazy("[p2] load x y z");
+    val cp2 = ((p2.x += 5, p2).1).toCell().load();
+    __expect_lazy("[p3] load (bits32) y, save immutable (tail)");
+    val y3 = (p3.y = 100 as int32).toCell().load();
+
+    return (cp1, cp2, y3, p3.toCell().load());
+}
+
 
 @method_id(400)
 fun demo400() {
-    var t = createEmptyTuple();
+    var t: array<slice> = [];
     t.push(stringHexToSlice("0102"));
     t.push(stringHexToSlice("0304"));
     t.push(stringHexToSlice("0506"));
@@ -1591,6 +1743,45 @@ fun demo411(s: slice) {
     }
 }
 
+@method_id(412)
+fun demo412() {
+    val msg = lazy AOrB.fromSlice(createEmptySlice());
+    match (msg) {
+    }
+    return 123;
+}
+
+@method_id(413)
+fun demo413() {
+    val c = Outer123{
+        opt: { x: 11, y: 12 },
+    }.toCell();
+
+    var o1 = lazy c.load();
+    var o2 = lazy c.load();
+    __expect_lazy("[o1] load opt");
+    if (o1.opt != null) {
+        o1.opt.x = 99;
+    }
+    __expect_lazy("[o2] load opt");
+    o2.opt!.y = 99;
+    return (o1.toCell().load(), o2.toCell().load());    
+}
+
+@method_id(414)
+fun demo414(setObj: bool) {
+    val c = Outer124{
+        opt: setObj ? { x: 11, y: 12 } : 80,
+    }.toCell();
+
+    var o1 = lazy c.load();
+    __expect_lazy("[o1] load opt");
+    if (o1.opt is Inner123) {
+        o1.opt.x = 99;
+    }
+    return o1.toCell().load();
+}
+
 
 fun main() {
     val s = stringHexToSlice("0102");
@@ -1628,10 +1819,10 @@ fun main() {
 @testcase | 113 | x{03ffff}       | -1
 @testcase | 113 | x{04000000FF}   | 255
 @testcase | 114 | x{0110}         | 16 1
-@testcase | 114 | x{020f}         | [ -15 ] typeid-27
+@testcase | 114 | x{020f}         | [ -15 ] typeid-2
 @testcase | 114 | x{03}           | -1 1
 @testcase | 114 | x{03ffff}       | -1 1
-@testcase | 114 | x{04000000FF}   | [ 255 ] typeid-27
+@testcase | 114 | x{04000000FF}   | [ 255 ] typeid-2
 @testcase | 115 | x{08}           | 8 42
 @testcase | 115 | x{88}           | 0 2
 @testcase | 115 | x{83}           | -1 2
@@ -1646,9 +1837,9 @@ fun main() {
 @testcase | 122 | x{010288}       | -8 1
 @testcase | 123 | x{010280}       | 5
 @testcase | 124 | x{010283}       | [ -3 2 ]
-@testcase | 125 |                 | 127 32 15 2 3 typeid-1 15 3 -1
-@testcase | 126 | x{7F0F20}       | 127 (null) (null) 15 typeid-3 32 15 -1
-@testcase | 126 | x{7F8F020320}   | 127 15 2 3 typeid-4 32 -1 2
+@testcase | 125 |                 | 127 32 15 2 3 typeid-6 15 3 -1
+@testcase | 126 | x{7F0F20}       | 127 (null) (null) 15 typeid-8 32 15 -1
+@testcase | 126 | x{7F8F020320}   | 127 15 2 3 typeid-7 32 -1 2
 @testcase | 127 |                 | 1 2 -1 255
 @testcase | 128 | x{5500}         | -1 -1
 @testcase | 128 | x{558F01024}    | 0 2
@@ -1697,6 +1888,7 @@ fun main() {
 @testcase | 157 |                 | -1
 @testcase | 158 |                 | 2 10 255
 @testcase | 159 |                 | -1 -1 31 -1 31
+@testcase | 160 |                 | 777
 
 @testcase | 200 |                 | 1
 @testcase | 201 |                 | 1 2 -1
@@ -1717,6 +1909,7 @@ fun main() {
 @testcase | 216 |                 | 12826 456
 @testcase | 217 |                 | 514
 @testcase | 218 |                 | 2 20 11636 20
+@testcase | 219 |                 | -1 -1
 
 @testcase | 300 |                 | -1
 @testcase | 301 |                 | 1 -1
@@ -1732,6 +1925,11 @@ fun main() {
 @testcase | 309 |                 | C{EE7C06B69DDCEFEBED507FE35F603A9019D4AE79A13F670FE4E08928AF484838}
 @testcase | 310 |                 | 3332695883 9
 @testcase | 311 |                 | C{16A4757FA412AD5E89418F1263904CD57FA4DF0E73EE8A53DC60F862C72BCD9D}
+@testcase | 312 |                 | -1 9 0
+@testcase | 313 |                 | 11 13 13 32
+@testcase | 314 |                 | 11 20 [ 8 [ 8 8 ] ] [ 8 [ 11 20 ] ] 32 [ 8 [ 8 9 ] ]
+@testcase | 315 |                 | 8 8 66 44 [ [ (null) (null) 0 ] ]
+@testcase | 316 |                 | 2 3 99 7 3 99 100 2 100 99
 
 @testcase | 400 |                             | 5
 @testcase | 401 | x{0110} -1                  | 50
@@ -1755,6 +1953,10 @@ fun main() {
 @testcase | 407 | x{BF}                       | -1
 @testcase | 408 |                             | 24
 @testcase | 409 |                             | 255 3
+@testcase | 412 |                             | 123
+@testcase | 413 |                             | 99 12 typeid-13 11 99 typeid-13
+@testcase | 414 | -1                          | 99 12 typeid-13
+@testcase | 414 | 0                           | (null) 80 42
 
 @fif_codegen
 """
@@ -1776,7 +1978,6 @@ fun main() {
 @fif_codegen
 """
   demo106() PROC:<{             //  s
-                                //  lazyS
     PUSHNULL                    //  lazyS x
     SWAP                        //  x lazyS
     8 LDU
@@ -1797,7 +1998,6 @@ fun main() {
 @fif_codegen
 """
   demo113() PROC:<{
-  //  lazyS
     x{01} SDBEGINSQ
     IF:<{
       8 PLDI
@@ -1889,8 +2089,7 @@ fun main() {
     IFJMP:<{                    //  '14
       NEWC                      //  '14 b
       STSLICE                   //  b
-      ENDC                      //  '21
-      CTOS                      //  s
+      BTOS                      //  s
 """
 
 @fif_codegen
@@ -1919,7 +2118,7 @@ fun main() {
     NEWC
     8 STI
     8 STI
-    ENDC
+    BTOS
 """
 
 @fif_codegen
@@ -1936,15 +2135,15 @@ fun main() {
 @fif_codegen
 """
   demo311() PROC:<{             //
-    777 PUSHINT                 //  '6=777
-    contract.getFakeData() CALLDICT       //  '7
+    777 PUSHINT                 //  '1=777
+    contract.getFakeData() CALLDICT       //  '2
     CTOS                        //  lazyS
     1 LDI                       //  '13 lazyS
     NIP                         //  lazyS
     320 PUSHINT                 //  lazyS '14=320
     PLDSLICEX                   //  '15
     PUSHNULL                    //  '15 st.extensions
-    NEWC
+    NEWC                        //  '15 st.extensions b
     b{0} STSLICECONST           //  '15 st.extensions b
     s1 s2 XCHG                  //  st.extensions '15 b
     STSLICE                     //  st.extensions b
@@ -1956,7 +2155,6 @@ fun main() {
 @fif_codegen
 """
   demo404() PROC:<{
-    //  lazyS
     x{12345678} SDBEGINSQ
     IF:<{
       32 PLDI
@@ -1994,7 +2192,6 @@ fun main() {
 @fif_codegen
 """
   demo410() PROC:<{
-    // lazyS
     x{01} SDBEGINSQ
     IFJMP:<{
       ...
@@ -2020,7 +2217,6 @@ fun main() {
 @fif_codegen
 """
   demo411() PROC:<{             //  s
-                                //  lazyS
     1 PLDU                      //  '10
     IFJMP:<{                    //
       DUMPSTK                   //

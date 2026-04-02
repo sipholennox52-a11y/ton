@@ -8,8 +8,8 @@ struct EitherRight<T> { value: T }
 type Either<L, R> = EitherLeft<L> | EitherRight<R>;
 
 @inline
-fun makeExternalAddress(hash: int, len: int): address {
-    return beginCell().storeUint(0b01, 2).storeUint(len, 9).storeUint(hash, len).endCell().beginParse() as address;
+fun makeExternalAddress(hash: int, len: int): any_address {
+    return beginCell().storeUint(0b01, 2).storeUint(len, 9).storeUint(hash, len).endCell().beginParse() as any_address;
 }
 
 
@@ -138,7 +138,7 @@ struct JustAddress {
 
 struct TwoInts32And64SepByAddress {
     op: int32;
-    addr_e: address;
+    addr_e: any_address;
     query_id: uint64;
 }
 
@@ -303,7 +303,7 @@ struct DifferentIntsWithMaybe {
 struct DifferentMix1 {
     ja1: JustAddress;
     ja2m: JustAddress?;
-    ext_nn: address;
+    ext_nn: any_address;
     imm: IntAndMaybeMaybe8;
     tis: TwoInts32And64SepByAddress;
 }
@@ -406,13 +406,79 @@ struct WithTwoRestFields {
     rest2: RemainingBitsAndRefs;
 }
 
+struct WithMaps {
+    m1: map<int8, RemainingBitsAndRefs>
+    m2: map<JustInt32, (int8, int8)>
+}
+
+struct WithNullableMaps {
+    m1: map<int32, int64>?
+    m2: map<int32, int64>?
+    m3: map<int32, int64>?
+    m4: map<int32, int64> | int32
+}
+
+enum EStoredAsInt8 { M100 = -100, Z = 0, P100 = 100 }
+enum EStoredAsUint1 { ZERO, ONE }
+
+struct WithEnums {
+    e1: EStoredAsInt8
+    e2: EStoredAsUint1
+    rem: uint7 = 0
+}
+
+type MyInt32 = int32
+type MaybeJustOfAddress = MaybeJust<address>
+type AddressAlias = address
+
+@overflow1023_policy("suppress")
+struct WithMoreTrickyAddresses1 {
+    a1: AddressAlias?
+    a2: address | MyInt32 | MaybeNothing
+    a3: TwoInts32And64 | MaybeJustOfAddress
+    a4: Cell<address?>?
+    a5: address | Cell<any_address>
+}
+
+@overflow1023_policy("suppress")
+struct WithMoreTrickyAddresses2 {
+    a1: Maybe<address>
+    a2: Maybe<address?>
+    a3: JustAddress?
+    a4: address | int64 | null
+    a5: address | Cell<address>
+}
+
+@overflow1023_policy("suppress")
+struct WithAnyAddress {
+    a1: any_address
+    a2: any_address?
+    a3: any_address | int64
+    a4: address | any_address
+    a5: Maybe<any_address>
+    a6: Cell<any_address>
+    a7: Cell<any_address?>?
+}
+
+struct WithArrays {
+    a1: array<int8>
+    a2: array<Cell<int8>>
+    a3: array<RemainingBitsAndRefs>
+    after: bool = true
+}
+
+struct WithStrings {
+    s1: string
+    s2: string?
+    arrs: array<string> = [],
+}
 
 
 // ---------------------------------------------
 
 
 @method_id(200)
-fun test_JustInt32_1() {
+fun `test JustInt32_1`() {
     var b = beginCell();
     b.storeAny(JustInt32{ value: 123 });
     b.storeAny(JustInt32{ value: 456 });
@@ -420,16 +486,16 @@ fun test_JustInt32_1() {
 }
 
 @method_id(201)
-fun test_JustInt32() {
-    run<JustInt32>({ value: 255}, stringHexToSlice("000000FF"));
-    var s = stringHexToSlice("0000007b000001c8");
+fun `test JustInt32`() {
+    run<JustInt32>({ value: 255}, "000000FF".hexToSlice());
+    var s = "0000007b000001c8".hexToSlice();
     return (s.loadAny<JustInt32>(), s.loadAny<JustInt32>());
 }
 
 @method_id(202)
 fun test_JustMaybeInt32() {
-    run<JustMaybeInt32>({ value: 255 }, stringHexToSlice("8000007FC_"));
-    run<JustMaybeInt32>({ value: null }, stringHexToSlice("4_"));
+    run<JustMaybeInt32>({ value: 255 }, "8000007FC_".hexToSlice());
+    run<JustMaybeInt32>({ value: null }, "4_".hexToSlice());
     return true;
 }
 
@@ -448,7 +514,7 @@ fun test_TwoInts32And64() {
 
 @method_id(205)
 fun test_TwoInts32AndRef64() {
-    run<TwoInts32AndRef64>({ op: 123, query_id_ref: { tvmCell: beginCell().storeUint(255,64).endCell() } }, stringHexToSlice("0000007B").appendRef(stringHexToSlice("00000000000000FF")));
+    run<TwoInts32AndRef64>({ op: 123, query_id_ref: (255 as uint64).toCell() }, stringHexToSlice("0000007B").appendRef(stringHexToSlice("00000000000000FF")));
     return true;
 }
 
@@ -468,6 +534,7 @@ fun test_JustAddress() {
 
 @method_id(208)
 fun test_TwoInts32And64SepByAddress() {
+    run<TwoInts32And64SepByAddress>({ op: 123, addr_e: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") as any_address, query_id: 256 } , stringHexToSlice("0000007B80194DC6438F99D3D9DBE151944925D90B2492954BF6B9C070FBFF2DDED5F30547C0000000000000201_"));
     run<TwoInts32And64SepByAddress>({ op: 123, addr_e: makeExternalAddress(70, 10), query_id: 255 } , stringHexToSlice("0000007B41423000000000000007FC_"));
     run<TwoInts32And64SepByAddress>({ op: 123, addr_e: makeExternalAddress(666, 20), query_id: 254 } , stringHexToSlice("0000007B4280053400000000000001FD_"));
     run<TwoInts32And64SepByAddress>({ op: 123, addr_e: createAddressNone(), query_id: 253 } , stringHexToSlice("0000007B000000000000003F6_"));
@@ -571,9 +638,9 @@ fun test_IntAndRestEitherCellOrRefCell() {
 fun test_DifferentMaybeRefs() {
     run<DifferentMaybeRefs>({ op: 123, ref1m: null, ref2m: null, ref3: generateCell_44_with_ref45(), ref4m32: null, query_id: 456}, stringHexToSlice("0000007B00000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))));
     run<DifferentMaybeRefs>({ op: 123, ref1m: generateCell_44_with_ref45(), ref2m: null, ref3: generateCell_44_with_ref45(), ref4m32: JustInt32{value: 999}.toCell(), query_id: 456}, stringHexToSlice("0000007BA0000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("000003E7")));
-    run<DifferentMaybeRefs>({ op: 123, ref1m: null, ref2m: beginCell().endCell(), ref3: generateCell_44_with_ref45(), ref4m32: JustInt32{value: 998}.toCell(), query_id: 456}, stringHexToSlice("0000007B60000000000000391_").appendRef("").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("000003E6")));
-    run<DifferentMaybeRefs>({ op: 123, ref1m: generateCell_44_with_ref45(), ref2m: generateCell_44_with_ref45(), ref3: beginCell().endCell(), ref4m32: null, query_id: 456}, stringHexToSlice("0000007BC0000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(""));
-    run<DifferentMaybeRefs>({ op: 123, ref1m: generateCell_44_with_ref45(), ref2m: beginCell().endCell(), ref3: generateCell_44_with_ref45(), ref4m32: JustInt32{value: 997}.toCell(), query_id: 456}, stringHexToSlice("0000007BE0000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef("").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("000003E5")));
+    run<DifferentMaybeRefs>({ op: 123, ref1m: null, ref2m: beginCell().endCell(), ref3: generateCell_44_with_ref45(), ref4m32: JustInt32{value: 998}.toCell(), query_id: 456}, stringHexToSlice("0000007B60000000000000391_").appendRef(createEmptySlice()).appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("000003E6")));
+    run<DifferentMaybeRefs>({ op: 123, ref1m: generateCell_44_with_ref45(), ref2m: generateCell_44_with_ref45(), ref3: beginCell().endCell(), ref4m32: null, query_id: 456}, stringHexToSlice("0000007BC0000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(createEmptySlice()));
+    run<DifferentMaybeRefs>({ op: 123, ref1m: generateCell_44_with_ref45(), ref2m: beginCell().endCell(), ref3: generateCell_44_with_ref45(), ref4m32: JustInt32{value: 997}.toCell(), query_id: 456}, stringHexToSlice("0000007BE0000000000000391_").appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef("".beginParse()).appendRef(stringHexToSlice("0000002C").appendRef(stringHexToSlice("0000002D"))).appendRef(stringHexToSlice("000003E5")));
     return true;
 }
 
@@ -607,7 +674,7 @@ fun test_DifferentMix2() {
     assert(iae1.query_id_maybe_ref == null, 400);
     assert_slice_is_44_and_ref45(r1.rest);
 
-    run<DifferentMix2>({ iae: { tvmCell: IntAndEither32OrRef64{ op: 778, i32orRef: { tvmCell: Inner2{ i64_in_ref: 9919992 }.toCell() }, query_id_maybe_ref: Inner1{ query_id_ref: 889477 }.toCell() }.toCell() }, tic: { op: 123, amount: 500000 }, rest: beginCell().endCell().beginParse() },
+    run<DifferentMix2>({ iae: IntAndEither32OrRef64{ op: 778, i32orRef: Inner2{ i64_in_ref: 9919992 }.toCell(), query_id_maybe_ref: Inner1{ query_id_ref: 889477 }.toCell() }.toCell(), tic: { op: 123, amount: 500000 }, rest: beginCell().endCell().beginParse() },
         stringHexToSlice("0000007B307A120").appendRef(stringHexToSlice("0000030AE_").appendRef(stringHexToSlice("0000000000975DF8")).appendRef(stringHexToSlice("00000000000D9285"))));
     var r2 = DifferentMix2.fromSlice(stringHexToSlice("0000007B307A120").appendRef(stringHexToSlice("0000030AE_").appendRef(stringHexToSlice("0000000000975DF8")).appendRef(stringHexToSlice("00000000000D9285"))));
     val iae2 = r2.iae.load();
@@ -654,7 +721,7 @@ fun test_RestIsBuilderOrRemaining() {
         .storeUint(5, 32)
         .storeAddress(address("9:527964d55cfa6eb731f4bfc07e9d025098097ef8505519e853986279bd8400d8"))
         .storeMaybeRef(JustInt32 { value: 123 }.toCell())
-        .storeRef(JustAddress { addr: createAddressNone() }.toCell());
+        .storeRef(JustAddress { addr: address("9:527964d55cfa6eb731f4bfc07e9d025098097ef8505519e853986279bd8400d8") }.toCell());
     var w: ReadWriteRest<builder> = {
         f1: 60,
         f2: ton("0.05"),
@@ -663,7 +730,7 @@ fun test_RestIsBuilderOrRemaining() {
     var r: ReadRest_Remaining = w.toCell().beginParse().loadAny();
     __expect_type(r.rest, "RemainingBitsAndRefs");
     var rest = Tail224.fromSlice(r.rest);
-    return (r.f1, r.f2, rest.ji.value, rest.addr.getWorkchain(), rest.ref1!.load(), rest.ref2.load().addr.isNone());
+    return (r.f1, r.f2, rest.ji.value, rest.addr.getWorkchain(), rest.ref1!.load(), (rest.ref2.load().addr as any_address).isNone());
 }
 
 @method_id(225)
@@ -716,6 +783,176 @@ fun test_EdgeCaseIntegers() {
     return edge.toCell().hash() == manual.endCell().hash()
 }
 
+@method_id(230)
+fun test_serializeMaps() {
+    var (
+        m1: map<int8, RemainingBitsAndRefs>,
+        m2: map<JustInt32, (int8, int8)>,
+    ) = (createEmptyMap(), createEmptyMap());
+    m1.set(1, createEmptySlice());
+    m1.set(2, stringHexToSlice("01").appendRef(stringHexToSlice("02")));
+    m2.set({value: 3}, (3, 30));
+    m2.set({value: 4}, (4, 40));
+
+    var w = (WithMaps { m1, m2 }).toCell().load();
+    w.m2.delete({value: 4});
+    val d3 = w.m2.deleteAndGetDeleted({value: 3});
+    var r = w.m1.findFirst();
+    var kl = (0, 0);
+    while (r.isFound) {
+        kl = r.loadValue().remainingBitsAndRefsCount();
+        r = w.m1.iterateNext(r);
+    }
+    return (w.m1.isEmpty(), w.m2.isEmpty(), d3.isFound, d3.loadValue(), kl);
+}
+    
+@method_id(231)
+fun test_nullableMaps() {
+    var o: WithNullableMaps = {
+        m1: createEmptyMap(),
+        m2: createEmptyMap(),
+        m3: null,
+        m4: createEmptyMap(),
+    };
+    if (o.m2 != null && o.m4 is map<int32, int64>) {
+        o.m2.set(1, 10);
+        o.m4.set(1, 10);
+    }
+    var c = o.toCell();
+    var s = c.beginParse();
+    var (bits, refs) = s.remainingBitsAndRefsCount();
+    assert(bits == 2+2+1+2) throw 123;
+    assert(refs == 0+1+0+1) throw 234;
+
+    o = c.load();
+    return (o.m1 == null, o.m1!.isEmpty(), o.m2 == null, o.m2!.isEmpty(), o.m3 == null, o.m4 is int32);
+}
+
+@method_id(232)
+fun test_SimpleEnums() {
+    run<WithEnums>({e1: EStoredAsInt8.M100, e2: EStoredAsUint1.ZERO}, stringHexToSlice("9c00"));
+    run<WithEnums>({e1: EStoredAsInt8.Z, e2: EStoredAsUint1.ZERO}, stringHexToSlice("0000"));
+    run<WithEnums>({e1: EStoredAsInt8.P100, e2: EStoredAsUint1.ONE, rem: 1}, stringHexToSlice("6481"));
+    return -1;
+}
+
+@method_id(233)
+fun test_WithMoreTrickyAddresses1() {
+    run(WithMoreTrickyAddresses1{
+        a1: address("UQDKbjIcfM6ezt8KjKJJLshZJJSqX7XOA4ff-W72r5gqPuwA"),
+        a2: MaybeNothing {},
+        a3: MaybeJust { value: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") },
+        a4: (null as address?).toCell(),
+        a5: address("0:0000000000000000000000000000000000000000000000000000000000000000"),
+    }, stringHexToSlice("80194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d6006537190e3e674f676f8546512497642c924a552fdae701c3effcb77b57cc151f50000000000000000000000000000000000000000000000000000000000000000002_").appendRef(stringHexToSlice("2_")));
+    run(WithMoreTrickyAddresses1{
+        a1: null,
+        a2: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e"),
+        a3: TwoInts32And64{ op: 123, query_id: 456 },
+        a4: null,
+        a5: createAddressNone().toCell(),
+    }, stringHexToSlice("080194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547c0000007b00000000000001c86_").appendRef(stringHexToSlice("2_")));
+
+    return true;
+}
+
+@method_id(234)
+fun test_WithMoreTrickyAddresses2() {
+    run(WithMoreTrickyAddresses2{
+        a1: MaybeJust { value: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") },
+        a2: MaybeJust { value: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") },
+        a3: null,
+        a4: 123,
+        a5: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e"),
+    }, stringHexToSlice("c00ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3ec00ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e600000000000000f680194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d_"));
+    run(WithMoreTrickyAddresses2{
+        a1: MaybeNothing {},
+        a2: MaybeJust { value: null },
+        a3: { addr: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") },
+        a4: null,
+        a5: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e").toCell(),
+    }, stringHexToSlice("4c00ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e6_").appendRef(stringHexToSlice("80194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d_")));
+    run(WithMoreTrickyAddresses2{
+        a1: MaybeNothing {},
+        a2: MaybeNothing {},
+        a3: null,
+        a4: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e"),
+        a5: address("EQAxL0oF1-zNgimPKthbDnYS4xj94rHtfNRN7_Pd1r2LNNv3").toCell(),
+    }, stringHexToSlice("1400ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3ec_").appendRef(stringHexToSlice("800625e940bafd99b04531e55b0b61cec25c631fbc563daf9a89bdfe7bbad7b1669_")));
+
+    return true;
+}
+
+@method_id(235)
+fun test_WithAnyAddress() {
+    run(WithAnyAddress{
+        a1: createAddressNone(),
+        a2: makeExternalAddress(800, 10),
+        a3: createAddressNone(),
+        a4: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e"),
+        a5: MaybeJust { value: address("EQAxL0oF1-zNgimPKthbDnYS4xj94rHtfNRN7_Pd1r2LNNv3") as any_address },
+        a6: createAddressNone().toCell(),
+        a7: (null as any_address?).toCell(),
+    }, stringHexToSlice("282b20080194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d800625e940bafd99b04531e55b0b61cec25c631fbc563daf9a89bdfe7bbad7b1669").appendRef(stringHexToSlice("2_")).appendRef(stringHexToSlice("4_")));
+    run(WithAnyAddress{
+        a1: makeExternalAddress(4, 4),
+        a2: null,
+        a3: makeExternalAddress(4, 10),
+        a4: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") as any_address,
+        a5: MaybeJust { value: makeExternalAddress(8, 8) },
+        a6: (address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") as any_address).toCell(),
+        a7: (createAddressNone() as any_address?).toCell(),
+    }, stringHexToSlice("408820a01300329b8c871f33a7b3b7c2a328924bb21649252a97ed7380e1f7fe5bbdabe60a8fa82023_").appendRef(stringHexToSlice("80194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d_")).appendRef(stringHexToSlice("9_")));
+    run(WithAnyAddress{
+        a1: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") as any_address,
+        a2: address("0:ca6e321c7cce9ecedf0a8ca2492ec8592494aa5fb5ce0387dff96ef6af982a3e") as any_address,
+        a3: 123,
+        a4: createAddressNone(),
+        a5: MaybeNothing {},
+        a6: makeExternalAddress(800, 10).toCell(),
+        a7: (makeExternalAddress(800, 10) as any_address?).toCell(),
+    }, stringHexToSlice("80194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d80194dc6438f99d3d9dbe151944925d90b2492954bf6b9c070fbff2dded5f30547d000000000000007b8c_").appendRef(stringHexToSlice("415904_")).appendRef(stringHexToSlice("a0ac82_")));
+    run(WithAnyAddress{
+        a1: createAddressNone(),
+        a2: createAddressNone(),
+        a3: createAddressNone(),
+        a4: createAddressNone(),
+        a5: MaybeNothing {},
+        a6: createAddressNone().toCell(),
+        a7: null,
+    }, stringHexToSlice("2084_").appendRef(stringHexToSlice("2_")));
+    
+    return true;
+}
+
+@method_id(236)
+fun test_WithArrays() {
+    run(WithArrays{
+        a1: [1],
+        a2: [(1 as int8).toCell()],
+        a3: [beginCell().storeUint(1, 32).toSlice()],
+    }, stringHexToSlice("0180C07").appendRef(stringHexToSlice("00C_")).appendRef(stringHexToSlice("4_").appendRef(stringHexToSlice("01"))).appendRef(stringHexToSlice("00000000C_")));
+    run(WithArrays{
+        a1: [],
+        a2: [],
+        a3: [beginCell().storeRef(createEmptyCell()).toSlice()],
+    }, stringHexToSlice("0000007").appendRef(stringHexToSlice("4_").appendRef("".literalSlice())));
+    return true;
+}
+
+@method_id(237)
+fun test_WithStrings() {
+    run(WithStrings{
+        s1: "one",
+        s2: "two",
+        arrs: ["1", "2", "3", "4", "5"],
+    }, "82E_".hexToSlice().appendRef("6F6E65".hexToSlice()).appendRef("74776F".hexToSlice()).appendRef(
+        "C_".hexToSlice().appendRef("4_".hexToSlice().appendRef("33".hexToSlice()).appendRef("34".hexToSlice()).appendRef("35".hexToSlice())).appendRef("31".hexToSlice()).appendRef("32".hexToSlice())
+    ));
+    return true;
+}
+
+
 fun main() {
     var t: JustInt32 = { value: 10 };
     var c = t.toCell();
@@ -737,23 +974,31 @@ fun main() {
 @testcase | 208 | | -1
 @testcase | 209 | | -1
 @testcase | 210 | | 123 555 46 (null)
-@testcase | 211 | | (null) typeid-4 123
-@testcase | 212 | | (null) typeid-5 123
+@testcase | 211 | | (null) typeid-3 123
+@testcase | 212 | | (null) typeid-4 123
 @testcase | 213 | | -1
 @testcase | 214 | | -1
 @testcase | 215 | | -1
 @testcase | 216 | | -1
 @testcase | 217 | | -1
 @testcase | 218 | | -1
-@testcase | 219 | | 44 (null) (null) 46 typeid-15
+@testcase | 219 | | 44 (null) (null) 46 typeid-11
 @testcase | 220 | | 0 0 (null) 99 typeid-8 typeid-9 99 1234 (null) 889129 14
 @testcase | 221 | | -1
-@testcase | 222 | | 510 567 9392843922 typeid-18 81923 81923 typeid-19 777 0 -1 (null) (null) 0 100000 100000 typeid-19
+@testcase | 222 | | 510 567 9392843922 typeid-13 81923 81923 typeid-14 777 0 -1 (null) (null) 0 100000 100000 typeid-14
 @testcase | 223 | | 10 55 (null)
-@testcase | 224 | | 60 50000000 5 9 123 -1
+@testcase | 224 | | 60 50000000 5 9 123 0
 @testcase | 225 | | 5 40 65535 8 50000000
 @testcase | 226 | | 1 16 0
 @testcase | 227 | | 16
 @testcase | 228 | | -1
 @testcase | 229 | | -1
+@testcase | 230 | | 0 -1 -1 3 30 8 1
+@testcase | 231 | | 0 -1 0 0 -1 0
+@testcase | 232 | | -1
+@testcase | 233 | | -1
+@testcase | 234 | | -1
+@testcase | 235 | | -1
+@testcase | 236 | | -1
+@testcase | 237 | | -1
  */

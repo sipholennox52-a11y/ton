@@ -18,13 +18,14 @@
 */
 #pragma once
 
-#include "td/actor/actor.h"
 #include "auto/tl/ton_api.h"
-#include "td/utils/port/IPAddress.h"
-#include "adnl-node-id.hpp"
-#include "adnl-node.h"
 #include "common/errorcode.h"
 #include "keyring/keyring.h"
+#include "td/actor/actor.h"
+#include "td/utils/port/IPAddress.h"
+
+#include "adnl-node-id.hpp"
+#include "adnl-node.h"
 
 namespace ton {
 
@@ -65,9 +66,11 @@ class Adnl : public AdnlSenderInterface {
  public:
   class Callback {
    public:
-    virtual void receive_message(AdnlNodeIdShort src, AdnlNodeIdShort dst, td::BufferSlice data) = 0;
+    virtual void receive_message(AdnlNodeIdShort src, AdnlNodeIdShort dst, td::BufferSlice data) {
+    }
     virtual void receive_query(AdnlNodeIdShort src, AdnlNodeIdShort dst, td::BufferSlice data,
-                               td::Promise<td::BufferSlice> promise) = 0;
+                               td::Promise<td::BufferSlice> promise) {
+    }
     virtual ~Callback() = default;
   };
 
@@ -115,6 +118,8 @@ class Adnl : public AdnlSenderInterface {
   // for example when you need to sent it further
   virtual void get_addr_list(AdnlNodeIdShort id, td::Promise<AdnlAddressList> promise) = 0;
   virtual void get_self_node(AdnlNodeIdShort id, td::Promise<AdnlNode> promise) = 0;
+
+  virtual void get_peer_node(AdnlNodeIdShort local_id, AdnlNodeIdShort peer_id, td::Promise<AdnlNode> promise) = 0;
 
   virtual void create_ext_server(std::vector<AdnlNodeIdShort> ids, std::vector<td::uint16> ports,
                                  td::Promise<td::actor::ActorOwn<AdnlExtServer>> promise) = 0;

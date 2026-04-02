@@ -13,11 +13,25 @@ struct Pair<T1, T2> {
 type MyInt = int;
 type WrappedInt = Wrapper<int>;
 type WrapperAlias<T> = Wrapper<T>;
+type ArrayOfT<T> = array<T>;
 
 struct DeepNested<T> {
     wrapper: WrapperAlias<Wrapper<T>>;
     pair: PairAlias<T, T>;
 }
+
+struct Quadriple<T1, T2, T3, T4> {
+    p1: Pair<T1, T2>
+    p2: Pair<T3, T4>
+}
+
+struct MaybeJust<T> {
+    value: T
+}
+
+struct MaybeNothing
+
+type Maybe<T,> = MaybeJust<T> | MaybeNothing
 
 
 fun eq<T>(v: T): T { return v; }
@@ -34,9 +48,36 @@ fun wrap2<T>(value: T) {
     return WrapperAlias<T> { value };
 }
 
+fun wrap0<T>(): Wrapper<T> {
+    return { value: 0 }
+}
+
+fun wrapNull<T>(): Wrapper<T> {
+    return { value: null }
+}
+
 fun makePair<A, B>(a: A, b: B) {
     var c: Pair<A,B> = { first: a, second: b };
     return c;
+}
+
+fun makePairOf0<A, B>(): Pair<A, B> {
+    return { first: 0, second: 0 }
+}
+
+fun Pair<T1, T2>.create(first: T1, second: T2): Pair<T1, T2> {
+    return { first, second }
+}
+
+fun acceptPairIntString(p: Pair<int, string>) {
+}
+
+fun Maybe<T>.none(): Maybe<T> {
+    return MaybeNothing{}
+}
+
+fun Maybe<T,>.value(value: T): Maybe<T> {
+    return MaybeJust{value}
 }
 
 
@@ -258,7 +299,7 @@ fun test14() {
     var s1 = Storage { Wrapper: wrap(999), backup: null };
     var s2 = Storage { Wrapper: wrap(makePair(1, "")), backup: makePair(2, "") };
     __expect_type(s1, "Storage<int>");
-    __expect_type(s2, "Storage<Pair<int, slice>>");
+    __expect_type(s2, "Storage<Pair<int, string>>");
     return (s1, s2.backup!.first);
 }
 
@@ -312,7 +353,7 @@ struct UnionHolder<T> {
 
 @method_id(118)
 fun test18() {
-    var uh: UnionHolder<int | slice> = { item: wrap(123 as int|slice), extra: wrap("" as int|slice|bool) };
+    var uh: UnionHolder<int | slice> = { item: wrap(123 as int|slice), extra: wrap(createEmptySlice() as int|slice|bool) };
     __expect_type(uh, "UnionHolder<int | slice>");
     __expect_type(uh.item, "Wrapper<int | slice>");
     __expect_type(uh.extra, "Wrapper<int | slice | bool>");
@@ -330,8 +371,8 @@ type StrangeAlsoInt = StrangeInt<()>;
 fun test19() {
     var i1: StrangeInt<builder> = 20;
     var i2: StrangeInt<slice> = 30;
-    var i3: StrangeInt<StrangeInt<int>> = 40 as StrangeAlsoInt;
-    i1 = i2; i2 = i1; i1 = i3; i3 = i1;
+    var i3: StrangeInt<StrangeInt<int>> = 40;
+    i1 = i2 as StrangeInt<builder>; i1 = i3 as StrangeInt<builder>;
     return (i1 as StrangeInt<()>, i3 as StrangeAlsoInt, i1 is StrangeInt, i1 is StrangeInt<cell>, i3 is StrangeInt, i3 is StrangeAlsoInt);
 }
 
@@ -376,7 +417,7 @@ fun test22(w: int | WrapperAlias<int> | slice) {
         WrapperAlias<MyInt> => {}
         slice => {}
     }
-    __expect_type(w, "int | Wrapper<MyInt> | slice");
+    __expect_type(w, "int | WrapperAlias<int> | slice");
     match (w) {
         MyInt => {}
         slice => {}
@@ -428,6 +469,118 @@ fun test25() {
     }
 }
 
+@method_id(126)
+fun test26() {
+    var m1: Wrapper<int>? = wrap0();
+    var m2 = wrap0() as Wrapper<int8>?;
+    var m3: WrapperAlias<uint32?>? = wrap0();
+    var m4: Wrapper<uint32?>? = wrapNull();
+    var m5 = wrap0() as Wrapper<uint32?>?;
+    var m6 = wrapNull() as WrapperAlias<uint32?>?;
+    var m7 = null as Wrapper<uint32?>?;
+    __expect_type(m1, "Wrapper<int>");
+    __expect_type(m2, "Wrapper<int8>?");
+    __expect_type(m3, "WrapperAlias<uint32?>");
+    __expect_type(m4, "Wrapper<uint32?>");
+    return (m1, m2, m3.value, m4.value, 777, m5, m6, m7);
+}
+
+fun test27() {
+    var pp1: Pair<int8, int10> | int = makePairOf0();
+    var pp2 = makePairOf0() as Pair<coins, coins?> | Wrapper<int>;
+    __expect_type(pp1, "Pair<int8, int10>");
+    __expect_type(pp2, "Pair<coins, coins?> | Wrapper<int>");
+}
+
+struct Box<T> {
+    private readonly item: T
+}
+
+fun Box<T>.create(v: T) {
+    return Box { item: v }
+}
+
+fun Box<T>.itemEquals(self, cmp: T) {
+    return self.item == cmp
+}
+
+fun Box<T>.itemEqualsTo<U>(self, cmp: Box<U>) {
+    return self.item == cmp.item
+}
+
+fun Box<T>.clone<U>(self) {
+    var b = Box { item: self.item as U };
+    b.item;
+    return b;
+}
+
+fun Box<KKK>.areEqual(b1: Box<KKK>, b2: Box<KKK>) {
+    return b1.item == b2.item
+}
+
+fun Box<int32>.specifiedGetItem(self) {
+    return self.item
+}
+
+@method_id(128)
+fun test28() {
+    var b1 = Box<int32>.create(5);
+    var b2 = Box<int256>.create(4);
+    var b3 = b2.clone<int>();
+    __expect_type(b3, "Box<int>");
+    return (
+        b1.itemEquals(0), b2.itemEquals(4),
+        b1.itemEqualsTo(b2), b2.itemEqualsTo(b3),
+        Box<int32>.areEqual(b1, b1),
+    );
+}
+
+@method_id(129)
+fun test29() {
+    // `Maybe.value()` and `Maybe.none()` don't require explicit T, auto guesses
+    var b_true: Maybe<bool> = Maybe.value(true);
+    var a_none: Maybe<address> = Maybe.none();
+    return (b_true, a_none);
+}
+
+fun test30() {
+    // T1/T2 auto deduced for `Pair` in `Pair.create()` here
+    var p_int_bool: Pair<int, bool> = Pair.create(1, true);
+    acceptPairIntString(Pair.create(1, "aba"));
+    var q = Quadriple<int, bool, slice, cell> {
+        p1: Pair.create(1, true),
+        p2: Pair.create(createEmptySlice(), createEmptyCell()),
+    };
+    Pair.create(1, createEmptyCell()) as Pair<int, cell>;
+
+    // for Box.create also
+    var b_string: Box<string> = Box.create("");
+    Box.create(true) as Box<bool>;
+}
+
+fun WrapperAlias<T>.getValueOfAlias(self): T { return self.value }
+
+fun getValueOfAlias<T>(w: WrapperAlias<T>): T { return w.value }
+
+fun test31(w1: Wrapper<int>, w2: WrapperAlias<int>) {
+  __expect_type(getValueOfAlias(w1), "int");
+  __expect_type(getValueOfAlias(w2), "int");
+  __expect_type((w1).getValueOfAlias(), "int");
+  __expect_type((w2).getValueOfAlias(), "int");
+}
+
+fun calcSizeOfArray<T, U>(arr: ArrayOfT<T>, arrNested: ArrayOfT<ArrayOfT<U>>): [T, U] {
+    return [arr.first(), arrNested.first().first()]
+}
+
+@method_id(132)
+fun test32() {
+    var pair = calcSizeOfArray([(2, 3)], [[4 as int32], [5 as int32]]);
+    __expect_type(pair.0, "(int, int)");
+    __expect_type(pair.1, "int32");
+    return pair;
+}
+
 
 fun main(c: Wrapper<slice>, d: WrappedInt) {
     __expect_type(c, "Wrapper<slice>");
@@ -437,7 +590,7 @@ fun main(c: Wrapper<slice>, d: WrappedInt) {
     __expect_type(WrappedInt { value: 200 }, "Wrapper<int>");
     __expect_type(Wrapper<slice>{ value: c.value }, "Wrapper<slice>");
     __expect_type(Wrapper<bytes32>{ value: c.value as bytes32 }, "Wrapper<bytes32>");
-    __expect_type(Wrapper<bytes32>{ value: Wrapper<bytes32> { value: (c.value as bytes32?)! }.value }, "Wrapper<bytes32>");
+    __expect_type(Wrapper<bytes32>{ value: Wrapper<bytes32> { value: (c.value as bytes32 as bytes32?)! }.value }, "Wrapper<bytes32>");
     __expect_type(Wrapper{ value: c.value }, "Wrapper<slice>");
     __expect_type(Wrapper{ value: c.value.loadInt(32) }, "Wrapper<int>");
     __expect_type(WrapperAlias{ value: 10 }, "Wrapper<int>");
@@ -453,24 +606,28 @@ fun main(c: Wrapper<slice>, d: WrappedInt) {
 @testcase | 104 |         | 11 11 13 13 13 2
 @testcase | 105 | 0       | 80
 @testcase | 105 | -1      | (null)
-@testcase | 106 |         | (null) (null) 0 777 1 2 typeid-14
+@testcase | 106 |         | (null) (null) 0 777 1 2 typeid-17
 @testcase | 107 | 5       | 20 20 5 5 20 777 (null) (null) (null) 0
-@testcase | 108 | 0       | 777 typeid-15 777 typeid-15
+@testcase | 108 | 0       | 777 typeid-1 777 typeid-1
 @testcase | 108 | -1      | 777 0 777 0
 @testcase | 109 |         | 40 40 70
 @testcase | 110 |         | 20 1 20 42
-@testcase | 111 |         | 5 1 typeid-4 5 1 typeid-4 5 1 typeid-4 5 1 typeid-4
-@testcase | 112 | -1      | 10 1 777 10 1 typeid-5
-@testcase | 112 | 0       | 20 1 777 (null) 0 typeid-6
+@testcase | 111 |         | 5 1 typeid-2 5 1 typeid-2 5 1 typeid-2 5 1 typeid-2
+@testcase | 112 | -1      | 10 1 777 10 1 typeid-3
+@testcase | 112 | 0       | 20 1 777 (null) 0 typeid-4
 @testcase | 113 |         | 30 -1
 @testcase | 114 |         | 999 (null) 2
 @testcase | 115 |         | 10 0 200 1 -1 200 1 -1
 @testcase | 116 |         | 1 2 3 4
 @testcase | 117 |         | 100 123
 @testcase | 118 |         | 123 1 777 123 1 -1 2
-@testcase | 119 |         | 40 40 -1 -1 -1 -1
-@testcase | 120 |         | (null) typeid-9 777 (null) (null) 0 typeid-11 -1 -1
+@testcase | 119 |         | 40 40 -1 0 -1 0
+@testcase | 120 |         | (null) typeid-9 777 (null) (null) 0 typeid-10 -1 -1
 @testcase | 123 |         | 10 10 10 10 10
+@testcase | 126 |         | 0 0 0 (null) 777 0 typeid-12 (null) typeid-12 (null) 0
+@testcase | 128 |         | 0 -1 0 -1 -1
+@testcase | 129 |         | -1 typeid-15 (null) typeid-16
+@testcase | 132 |         | [ [ 2 3 ] 4 ]
 
 
 @fif_codegen

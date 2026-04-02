@@ -1,3 +1,79 @@
+## 2026.03 Update
+
+1. Stability improvements in Simplex consensus: better handling of votes and certificates, additional rate limits, and tunable noncritical parameters for timing and DoS protection.
+2. Networking improvements: fixes in QUIC, twostep broadcasts, overlays and candidate deduplication/filtering, plus better handling of large traffic bursts.
+3. Better operational visibility: OpenMetrics exporter with QUIC statistics and related node telemetry improvements.
+4. Expanded testing and tooling: stronger consensus tests, QUIC interoperability tests, and improvements in Tontester and tonlib.
+5. Various fixes in node, compression, build and CI infrastructure.
+
+Besides the work of the core team, this update also includes contributions from multiple bug-bounty hunters and [https://t.me/contest/447](contest) participants. The full list will be added to changelog and release note after contest result finalization.
+
+# 2026.02-1 Update
+
+Multiple stability fixes
+
+Besides the work of the core team, this update also includes contributions from
+- Vahagn @vah13
+- InfiniteSec team [https://x.com/infsec_io](https://x.com/infsec_io)
+- Christos from [Cantina and Spearbit](https://cantina.xyz)
+- [@killme8848](https://t.me/killme8848)
+- [Tonred team](https://github.com/tonred)
+- [ret2happy](https://x.com/ret2happy)
+
+## 2026.02 Update
+
+1. Preparation for upcoming network speed up: disabled by default but ready to deploy new broadcast and consensus
+2. Consequent external message allowed: liteservers now accept external messages with seqno higher than seqno in last commited state iff it knows previous uncommited external message
+3. Improved non-final LS interface which allows faster candidate indexing
+4. Fixed memory leak which causes OOM on LSes
+5. Improved block compression
+6. More stable custom overlays
+7. Fixed a few performance and stability issues
+8. Added Tontester framework
+
+Besides the work of the core team, this update also includes contributions from Vahagn @vah13, InfiniteSec team [https://x.com/infsec_io](x.com/infsec_io) and Christos from [Cantina and Spearbit](cantina.xyz).
+## 2025.12 Update
+
+1. `celldb-v2` enabled by default.
+2. Fast state serializer (sharded serialization) enabled by default.
+3. Using `_` instead of `:` in package filenames for better compatibility with Windows and network protocols.
+4. Introduced parallelism in the validator engine.
+5. Added Python-based testing framework.
+6. Various fixes in emulator, node, TVM, `Asm.fif`.
+7. Introduced improved network traffic compression.
+8. BLST updated.
+
+Internal code changes:
+
+1. Introduced support for coroutines in actors.
+2. Enabled `clang-format` 21.
+3. Removed the virtualization level concept.
+4. Minor code style and cleanliness improvements.
+
+Besides the work of the core team, this update also includes contributions from Tonstudio team members: @pyAndr3w (`Asm.fif`), @Gusarich (TVM fixes in `arithops`), @Kaladin13 (node fixes).
+
+## 2025.11 Update
+
+1. [TVM version v12](./doc/GlobalVersions.md) update: [forbid unused high bits in extra_flags](https://github.com/ton-blockchain/TEPs/pull/503/commits/d949d70d5a69026d273cbbc07653d12c4373117a), [bounce extra_flags equal to initial message extra_flags](https://github.com/ton-blockchain/TEPs/pull/503/commits/d33ff342d69de04f1c33d11360dcf06b63a6c21e), [new TVM opcodes](https://github.com/ton-blockchain/ton/commit/ecd8fbb833c408eb34ec1aa4516e9e4344b54a22).
+2. Abseil upgrade
+3. Improvements in node synchronisation
+4. Fixing rare ArchiveManager issues
+5. Various improvements in logging, builds, DHT node behavior, private net launching, failure handlers.
+
+Besides the work of the core team, this update is based on the efforts of the @Lapo4kaKek and [Vahagn x.com/vah_13](https://x.com/vah_13).
+
+## 2025.10 Update
+
+1. [TVM version v12](./doc/GlobalVersions.md): full bounces, new `BTOS` and `HASHBU` instuctions, limit on contract size in masterchain.
+2. Optimistic collation/validation: allow nodes to generate and check block candidates before previous block is fully signed (not fully activated yet).
+3. Introduced custom block compression algorithm.
+4. Overlay improvements: improved overlay discovery on shard configuration update, private externals in custom overlays.
+5. Various improvements: session stats, telemetry in fast-sync overlay, earlier block broadcasts, limiting ttl for values in DHT, fixing search by utime in native blockexplorer, faster downloading candidates in validator session, parallelization of storing to cell_db, avoiding touching packfiles on startup.
+
+Besides the work of the core team, this update is based on the efforts of the Tonstudio team: @hacker-volodya @Shvandre; and @mkiesel (avoiding touching packfiles on startup).
+
+
+
 ## 2025.07 Accelerator Update
 
 Separation of validation and collation processes that allows to host them on independent machines and achieve full horizontal scaling. [More details in documentation](https://docs.ton.org/v3/documentation/infra/nodes/validation/collators)
@@ -85,7 +161,7 @@ Besides the work of the core team, this update is based on the efforts of @krigg
 
 ## 2024.08 Update
 
-1. Introduction of dispatch queues, message envelopes with transaction chain metadata, and explicitly stored msg_queue size, which will be activated by `Config8.version >= 8` and new `Config8.capabilities` bits: `capStoreOutMsgQueueSize`, `capMsgMetadata`, `capDeferMessages`. 
+1. Introduction of dispatch queues, message envelopes with transaction chain metadata, and explicitly stored msg_queue size, which will be activated by `Config8.version >= 8` and new `Config8.capabilities` bits: `capStoreOutMsgQueueSize`, `capMsgMetadata`, `capDeferMessages`.
 2. A number of changes to transaction executor which will activated for `Config8.version >= 8`:
     - Check mode on invalid `action_send_msg`. Ignore action if `IGNORE_ERROR` (+2) bit is set, bounce if `BOUNCE_ON_FAIL` (+16) bit is set.
     - Slightly change random seed generation to fix mix of `addr_rewrite` and `addr`.
@@ -104,7 +180,7 @@ Besides the work of the core team, this update is based on the efforts of @krigg
 
 1. Make Jemalloc default allocator
 2. Add candidate broadcasting and caching
-3. Limit per address speed for external messages broadcast by reasonably large number 
+3. Limit per address speed for external messages broadcast by reasonably large number
 4. Overlay improvements: fix dropping peers in small custom overlays, fix wrong certificate on missed keyblocks
 5. Extended statistics and logs for celldb usage, session stats, persistent state serialization
 6. Tonlib and explorer fixes
@@ -211,7 +287,7 @@ Besides the work of the core team, this update is based on the efforts of @aleks
 
 ## 2023.04 Update
 1. CPU load optimization: previous DHT reconnect policy was too aggressive
-2. Network throughput improvements: granular control on external message broadcast, optimize celldb GC, adjust state serialization and block downloading timings, rldp2 for states and archives 
+2. Network throughput improvements: granular control on external message broadcast, optimize celldb GC, adjust state serialization and block downloading timings, rldp2 for states and archives
 3. Update for Fift (namespaces) and Fift libraries (list of improvements: https://github.com/ton-blockchain/ton/issues/631)
 4. Better handling of incorrect inputs in funC: fix UB and prevent crashes on some inputs, improve optimizing int consts and unused variables in FunC, fix analyzing repeat loop. FunC version is increase to 0.4.3.
 5. `listBlockTransactionsExt` in liteserver added

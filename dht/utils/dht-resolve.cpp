@@ -1,4 +1,4 @@
-/* 
+/*
     This file is part of TON Blockchain source code.
 
     TON Blockchain is free software; you can redistribute it and/or
@@ -14,33 +14,33 @@
     You should have received a copy of the GNU General Public License
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
-    In addition, as a special exception, the copyright holders give permission 
-    to link the code of portions of this program with the OpenSSL library. 
-    You must obey the GNU General Public License in all respects for all 
-    of the code used other than OpenSSL. If you modify file(s) with this 
-    exception, you may extend this exception to your version of the file(s), 
-    but you are not obligated to do so. If you do not wish to do so, delete this 
-    exception statement from your version. If you delete this exception statement 
+    In addition, as a special exception, the copyright holders give permission
+    to link the code of portions of this program with the OpenSSL library.
+    You must obey the GNU General Public License in all respects for all
+    of the code used other than OpenSSL. If you modify file(s) with this
+    exception, you may extend this exception to your version of the file(s),
+    but you are not obligated to do so. If you do not wish to do so, delete this
+    exception statement from your version. If you delete this exception statement
     from all source files in the program, then also delete it here.
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <iostream>
+
 #include "adnl/adnl-network-manager.h"
 #include "adnl/adnl.h"
 #include "adnl/utils.hpp"
-#include "keys/encryptor.h"
-#include "td/utils/Time.h"
-#include "td/utils/format.h"
-#include "td/utils/OptionParser.h"
-#include "td/utils/filesystem.h"
-#include "dht/dht.hpp"
 #include "auto/tl/ton_api_json.h"
 #include "common/delay.h"
-#include "td/utils/Random.h"
-#include "terminal/terminal.h"
 #include "common/util.h"
-
-#include <iostream>
+#include "dht/dht.hpp"
+#include "keys/encryptor.h"
+#include "td/utils/OptionParser.h"
+#include "td/utils/Random.h"
+#include "td/utils/Time.h"
+#include "td/utils/filesystem.h"
+#include "td/utils/format.h"
+#include "terminal/terminal.h"
 
 class Resolver : public td::actor::Actor {
  private:
@@ -132,7 +132,7 @@ class Resolver : public td::actor::Actor {
     if (!conf.dht_) {
       return td::Status::Error(ton::ErrorCode::error, "does not contain [dht] section");
     }
-    ton::ton_api::dht_nodes* static_nodes = nullptr;
+    ton::ton_api::dht_nodes *static_nodes = nullptr;
     ton::ton_api::downcast_call(*conf.dht_, [&](auto &f) { static_nodes = f.static_nodes_.get(); });
     auto &nodes = static_nodes->nodes_;
     if (server_idx_ >= 0) {
@@ -149,7 +149,7 @@ class Resolver : public td::actor::Actor {
 };
 
 td::Result<td::Bits256> parse_bits256(td::Slice s) {
-  td::BufferSlice str = td::base64_decode(s, true);
+  td::BufferSlice str = td::base64_decode_to_buffer_slice(s, true);
   if (str.size() != 32) {
     return td::Status::Error("Invalid bits256");
   }

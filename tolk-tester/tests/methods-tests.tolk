@@ -73,7 +73,7 @@ fun test1() {
 
 @method_id(102)
 fun test2(a: int8, b: int16) {
-    var c = b as coins?;
+    var c = b as coins as coins?;
     return (a.plus1(), b.plusN(a), c!.plus1());
 }
 
@@ -99,7 +99,7 @@ fun test4() {
 
 @method_id(105)
 fun test5(a: MInt, b: int) {
-    var t = [a,b];
+    var t = [a,b] as [MInt, int];
     return (t.getSum(), t.assignLast(a+b), t.getSum(), Tuple2Int.getLast(t));
 }
 
@@ -132,7 +132,7 @@ fun test8(x: int32) {
     var cp = x.copy();
     x.assign(10);
     int32.assign(mutate x, x+cp);
-    (x as int18).assign(x+2);
+    x.assign(x+2);
     __expect_type(x, "int32");
     return (x, cp);
 }
@@ -191,11 +191,11 @@ fun T?.arbitraryMethod(self): never { throw 123; }
 
 fun test12() {
     __expect_type(10.arbitraryMethod(), "int?");
-    __expect_type((10 as int8?).arbitraryMethod(), "int?");
     __expect_type((10 as coins?)!.arbitraryMethod(), "int?");
 
-    __expect_type(null.arbitraryMethod(), "int?");
-    __expect_type((10 as coins?).arbitraryMethod(), "int?");
+    __expect_type((10 as int8?).arbitraryMethod(), "never");
+    __expect_type(null.arbitraryMethod(), "never");
+    __expect_type((10 as coins?).arbitraryMethod(), "never");
 
     __expect_type(Wrapper { item: 10 }.arbitraryMethod(), "Wrapper<MInt>");
     __expect_type(Wrapper<int> { item: 10 as int8 }.arbitraryMethod(), "Wrapper<MInt>");
@@ -280,12 +280,46 @@ fun Wrapper<T>.createFrom<U>(item: U): Wrapper<T> { return {item}; }
 fun test18() {
     __expect_type(10.copy, "(int) -> int");
     __expect_type(Wrapper{item:null as int8?}.copy, "(Wrapper<int8?>) -> Wrapper<int8?>");
-    __expect_type(Wrapper<int>.createNull, "() -> Wrapper<int?>");
+    __expect_type(Wrapper<int?>.createNull, "() -> Wrapper<int?>");
     __expect_type(Wrapper<Wrapper<slice?>?>.createNull, "() -> Wrapper<Wrapper<slice?>?>");
     __expect_type(Wrapper<int?>.createFrom<int8>, "(int8) -> Wrapper<int?>");
 
     var cb = Wrapper<int?>.createFrom<int8>;
     return cb(10);
+}
+
+type BalanceList = dict
+type AssetList = dict
+
+fun BalanceList.validate(self): int1 { return 0 }
+fun AssetList.validate(self): int2 { return 0 }
+
+fun test19(b: BalanceList, a: AssetList) {
+    __expect_type(b.validate(), "int1");
+    __expect_type(a.validate(), "int2");
+    
+    if (b == null) {}
+    match (a) {
+        null => {}
+        cell => {}
+    }
+    __expect_type(b, "BalanceList");
+    __expect_type(a, "AssetList");
+}
+
+fun int.double(self) {
+    return self * 2
+}
+
+fun getI1(v: int?, default: int) {
+    callOrder.push(v);
+    return v ?? default
+}
+
+@method_id(120)
+fun test20(v1: int?) {
+    callOrder = [];
+    return ((getI1(v1, 5) ?? getI1(100, 10)).double(), callOrder)
 }
 
 fun main() {}
@@ -300,7 +334,7 @@ fun main() {}
 @testcase | 107 |        | 2 1 -1
 @testcase | 108 | 5      | 17 5
 @testcase | 109 |        | 5 100500 20 30 5 5 31
-@testcase | 110 |        | [ 2 3 1 1 3 1 1 ] -1
+@testcase | 110 |        | [ 2 3 1 1 1 1 1 ] -1
 @testcase | 111 |        | [ 1 2 3 3 2 ]
 @testcase | 113 |        | 0 -1 -1 -1 0 -1
 @testcase | 114 |        | -1 -1 0 0 0
@@ -308,6 +342,8 @@ fun main() {}
 @testcase | 116 |        | 100 100 5
 @testcase | 117 |        | 3
 @testcase | 118 |        | 10
+@testcase | 120 | 6      | 12 [ 6 ] 
+@testcase | 120 | null   | 10 [ (null) ] 
 
 @fif_codegen DECLPROC Pair<int16,int8>.createFrom<int,coins>()
 @fif_codegen DECLPROC Pair<int8,int16>.compareWith<int16,int8>()

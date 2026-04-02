@@ -4,15 +4,15 @@ const cc2 = address("EQDKbjIcfM6ezt8KjKJJLshZJJSqX7XOA4ff-W72r5gqPrHF");
 fun verifyAddr(addr: address, workchain: int, number: int) {
     assert (addr == addr) throw 111;
     assert (!(addr != addr)) throw 111;
-    assert (addr.isInternal(), 111);
-    assert (!addr.isExternal(), 111);
-    assert (!addr.isNone(), 111);
+    assert (addr == (addr as any_address), 111);
+    assert ((addr as any_address).isInternal(), 111);
     assert (addr.bitsEqual(addr), 111);
 
     var (wc, h) = addr.getWorkchainAndHash();
     assert (wc == workchain) throw 111;
     assert (h == number) throw 111;
     assert (addr.getWorkchain() == workchain) throw 111;
+    assert (address.fromWorkchainAndHash(workchain, number) == addr) throw 113;
 
     var s = addr as slice;
     assert (s.remainingBitsCount() == 3 + 8 + 256) throw 112;
@@ -30,6 +30,7 @@ fun check0(addr: address) {
     assert (addr.getWorkchain() == 0) throw 111;
 }
 
+@method_id(90)
 fun codegenAddrEq(a: address, b: address) {
     if (a == b) { return 1; }
     if (a != b) { return 2; }
@@ -141,20 +142,21 @@ fun main() {
         (cc1 as slice).bitsEqual(((cc2 as slice) as address) as slice),
         createAddressNone() == cc1,
         createAddressNone() == address.createNone(),
-        check0(address("0:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFfffffffffffffffffffffffffffff"))
+        check0(address("0:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFfffffffffffffffffffffffffffff")),
+        cc1 == cc1 as bits267 as address,
+        cc1 == cc1 as slice as bits999 as address,
     );
 }
 
 /**
-@testcase | 0   |   | -1 0 -1 0 -1
+@testcase | 0   |   | -1 0 -1 0 -1 -1 -1
 
 @fif_codegen
 """
   check0() PROC:<{             	//  addr
     REWRITESTDADDR
     DROP                    	//  '2
-    0 EQINT                 	//  '4
-    111 THROWIFNOT          	//
+    111 THROWIF              	//
   }>
 """
 

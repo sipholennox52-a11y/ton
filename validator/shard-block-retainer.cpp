@@ -14,8 +14,10 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/delay.h"
+#include "interfaces/validator-full-id.h"
+
 #include "shard-block-retainer.hpp"
-#include <delay.h>
 
 namespace ton::validator {
 
@@ -69,8 +71,8 @@ void ShardBlockRetainer::update_masterchain_state(td::Ref<MasterchainState> stat
         adnl::AdnlNodeIdShort adnl_id{val.addr};
         if (adnl_id.is_zero()) {
           adnl_id = adnl::AdnlNodeIdShort{ValidatorFullId{val.key}.short_id()};
-          validator_adnl_ids_.insert(adnl_id);
         }
+        validator_adnl_ids_.insert(adnl_id);
       }
     }
     LOG(INFO) << "Updating validator set: " << validator_adnl_ids_.size() << " adnl ids";
@@ -109,7 +111,7 @@ void ShardBlockRetainer::new_shard_block_description(td::Ref<ShardTopBlockDescri
     return;
   }
   td::actor::send_closure(
-      manager_, &ValidatorManager::wait_block_state_short, desc->block_id(), 0, td::Timestamp::in(30.0),
+      manager_, &ValidatorManager::wait_block_state_short, desc->block_id(), 0, td::Timestamp::in(30.0), true,
       [SelfId = actor_id(this), desc](td::Result<td::Ref<ShardState>> R) {
         if (R.is_error()) {
           LOG(WARNING) << "Wait block state for " << desc->block_id().to_str() << " : " << R.move_as_error();
